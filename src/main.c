@@ -1,1356 +1,889 @@
-// Mem Reduct
+// Mem Reduct (whitelist edition)
 // Copyright (c) 2011-2026 Henry++
 
 #include "routine.h"
 
-#include "main.h"
+#include "app.h"
 #include "rapp.h"
-
 #include "resource.h"
 
-STATIC_DATA config = {0};
+#include "strings_cn.h"
+#include "whitelist.h"
+#include "memtrim.h"
 
-ULONG limits_arr[13] = {0};
-ULONG intervals_arr[13] = {0};
+#define TIMER_UID 1337
+#define TIMER_INTERVAL 1000
 
-INT WINAPIV compare_numbers (
-	_In_opt_ PVOID context,
-	_In_ LPCVOID ptr1,
-	_In_ LPCVOID ptr2
-)
+#define AUTOCLEAN_COOLDOWN 30
+#define AUTOCLEAN_DEFAULT_PERCENT 85
+#define AUTOCLEAN_MIN_PERCENT 20
+#define AUTOCLEAN_MAX_PERCENT 99
+
+// usage must fall this many points below the threshold to re-arm
+#define AUTOCLEAN_HYSTERESIS 5
+
+// re-arm interval; doubled when the threshold is below the recommended value
+#define AUTOCLEAN_REARM_INTERVAL 300
+#define AUTOCLEAN_REARM_INTERVAL_LOW 600
+
+// below this value the automatic cleanup is likely to fire too often
+#define AUTOCLEAN_RECOMMENDED_PERCENT 50
+
+// tray stages: green (idle) / yellow (busy) / red (tight)
+#define TRAY_WARNING_DEFAULT 70
+#define TRAY_DANGER_DEFAULT 85
+#define TRAY_WARNING_MIN 30
+#define TRAY_WARNING_MAX 90
+#define TRAY_DANGER_MIN 40
+#define TRAY_DANGER_MAX 99
+#define TRAY_STAGE_GAP 5
+
+#define INI_FILENAME L"memreduct.ini"
+#define INI_SECTION L"main"
+
+static const GUID GUID_TRAYICON = {0xAE9053F0, 0x8D59, 0x4803, {0x9A, 0xBB, 0x74, 0xAF, 0xE6, 0x6B, 0x5F, 0xD2}};
+
+static WCHAR config_path[0x400] = {0};
+static BOOLEAN is_exiting = FALSE;
+static BOOLEAN is_trayhintshown = FALSE;
+static ULONG last_clean_time = 0;
+static BOOLEAN is_autoclean_armed = TRUE;
+static BOOLEAN is_blockedhintshown = FALSE;
+
+static HICON tray_icon = NULL;
+static ULONG tray_percent = ULONG_MAX;
+
+// simple decimal text to unsigned long
+static ULONG _app_parseulong (LPCWSTR string)
 {
-	ULONG val1, val2;
+	ULONG value = 0;
+	ULONG_PTR i = 0;
 
-	val1 = PtrToUlong (ptr1);
-	val2 = PtrToUlong (ptr2);
+	if (!string)
+		return 0;
 
-	if (val1 < val2)
-		return -1;
+	while (string[i] >= L'0' && string[i] <= L'9' && i < 10)
+	{
+		value = (value * 10) + (ULONG)(string[i] - L'0');
 
-	if (val1 > val2)
-		return 1;
+		i++;
+	}
 
-	return 0;
+	return value;
 }
 
-VOID _app_generate_array (
-	_Out_ _Writable_elements_ (count) PULONG integers,
-	_In_ ULONG_PTR count,
-	_In_ ULONG value,
-	_In_ ULONG max_value
-)
+// configuration file path (application directory)
+static VOID _app_initializeconfig (VOID)
 {
-	PR_HASHTABLE hashtable;
-	ULONG_PTR enum_key = 0;
-	ULONG hash_code, index = 0;
+	WCHAR directory[0x400];
+	ULONG length;
 
-	RtlSecureZeroMemory (integers, sizeof (ULONG) * count);
+	length = GetModuleFileNameW (NULL, directory, RTL_NUMBER_OF (directory));
 
-	hashtable = _r_obj_createhashtable (sizeof (BOOLEAN), 0x10, NULL);
+	if (length == 0 || length >= RTL_NUMBER_OF (directory))
+		return;
 
-	for (index = 1; index < 9; index++)
+	for (ULONG i = length; i > 0; i--)
 	{
-		_r_obj_addhashtableitem (hashtable, index * 10, NULL);
-	}
+		if (directory[i - 1] == L'\\')
+		{
+			directory[i] = UNICODE_NULL;
 
-	for (index = (value > 2) ? (value - 2) : 1; index <= (value + 2); index++)
-	{
-		if (index >= 5)
-			_r_obj_addhashtableitem (hashtable, index, NULL);
-	}
-
-	index = 0;
-
-	while (_r_obj_enumhashtable (hashtable, NULL, &hash_code, &enum_key))
-	{
-		if (hash_code <= max_value)
-			integers[index] = hash_code;
-
-		if (++index >= count)
 			break;
+		}
 	}
 
-	qsort_s (integers, count, sizeof (ULONG), &compare_numbers, NULL);
-
-	_r_obj_dereference (hashtable);
+	_r_str_printf (config_path, RTL_NUMBER_OF (config_path), L"%s%s", directory, INI_FILENAME);
 }
 
-VOID _app_generate_menu (
-	_In_ HMENU hsubmenu,
-	_In_ ULONG menu_idx,
-	_Out_ _Writable_elements_ (count) PULONG integers,
-	_In_ ULONG_PTR count,
-	_In_ LPCWSTR format,
-	_In_ ULONG value,
-	_In_ ULONG max_value,
-	_In_ BOOLEAN is_enabled
-)
+static ULONG _app_getconfig (LPCWSTR key_name, ULONG def_value)
 {
-	WCHAR buffer[0x40];
-	LONG64 menu_value;
-	ULONG menu_id, menu_items = 0;
-	BOOLEAN is_checked = FALSE;
+	if (config_path[0] == UNICODE_NULL)
+		return def_value;
 
-	_r_menu_setitemtext (hsubmenu, 0, TRUE, _r_locale_getstring (IDS_TRAY_DISABLE));
+	return (ULONG)GetPrivateProfileIntW (INI_SECTION, key_name, (INT)def_value, config_path);
+}
 
-	_app_generate_array (integers, count, value, max_value);
+static VOID _app_setconfig (LPCWSTR key_name, ULONG value)
+{
+	WCHAR buffer[0x20];
 
-	for (ULONG i = 0; i < count; i++)
+	if (config_path[0] == UNICODE_NULL)
+		return;
+
+	_r_str_fromulong (buffer, RTL_NUMBER_OF (buffer), value);
+
+	WritePrivateProfileStringW (INI_SECTION, key_name, buffer, config_path);
+}
+
+// clamp the automatic cleanup threshold
+static ULONG _app_getautocleanpercent (VOID)
+{
+	ULONG percent = _app_getconfig (L"AutoCleanPercent", AUTOCLEAN_DEFAULT_PERCENT);
+
+	if (percent < AUTOCLEAN_MIN_PERCENT)
+		percent = AUTOCLEAN_MIN_PERCENT;
+
+	if (percent > AUTOCLEAN_MAX_PERCENT)
+		percent = AUTOCLEAN_MAX_PERCENT;
+
+	return percent;
+}
+
+// stage thresholds, validated and ordered
+static VOID _app_gettraylevels (PULONG warning_level, PULONG danger_level)
+{
+	ULONG warning = _app_getconfig (L"TrayWarningPercent", TRAY_WARNING_DEFAULT);
+	ULONG danger = _app_getconfig (L"TrayDangerPercent", TRAY_DANGER_DEFAULT);
+
+	if (warning < TRAY_WARNING_MIN)
+		warning = TRAY_WARNING_MIN;
+
+	if (warning > TRAY_WARNING_MAX)
+		warning = TRAY_WARNING_MAX;
+
+	if (danger < TRAY_DANGER_MIN)
+		danger = TRAY_DANGER_MIN;
+
+	if (danger > TRAY_DANGER_MAX)
+		danger = TRAY_DANGER_MAX;
+
+	// keep a minimum gap between stages
+	if (danger < (warning + TRAY_STAGE_GAP))
+		danger = warning + TRAY_STAGE_GAP;
+
+	if (danger > TRAY_DANGER_MAX)
 	{
-		menu_value = integers[i];
+		danger = TRAY_DANGER_MAX;
 
-		if (!menu_value)
+		if (warning > (danger - TRAY_STAGE_GAP))
+			warning = danger - TRAY_STAGE_GAP;
+	}
+
+	*warning_level = warning;
+	*danger_level = danger;
+}
+
+// show the low-threshold warning only when it applies
+static VOID _app_updateautowarn (HWND hwnd)
+{
+	ShowWindow (
+		GetDlgItem (hwnd, IDC_AUTO_WARN),
+		(_app_getautocleanpercent () < AUTOCLEAN_RECOMMENDED_PERCENT) ? SW_SHOW : SW_HIDE
+	);
+}
+
+// draw the memory percentage into a tray icon (green / yellow / red stages)
+static HICON _app_createicon (ULONG percent)
+{
+	ICONINFO icon_info = {0};
+	HBRUSH hbrush;
+	HBITMAP hbitmap, hbitmap_mask;
+	HGDIOBJ old_bitmap;
+	HFONT hfont, old_font;
+	HDC hscreen, hdc;
+	RECT rect;
+	SIZE extent;
+	WCHAR text[0x08];
+	COLORREF bg_color, text_color;
+	INT icon_size, font_height, text_length;
+	ULONG warning_level, danger_level;
+	HICON hicon;
+
+	icon_size = GetSystemMetrics (SM_CXSMICON);
+
+	if (icon_size <= 0)
+		icon_size = 16;
+
+	_app_gettraylevels (&warning_level, &danger_level);
+
+	if (percent >= danger_level)
+	{
+		bg_color = RGB (0xE0, 0x20, 0x20);
+		text_color = RGB (0xFF, 0xFF, 0xFF);
+	}
+	else if (percent >= warning_level)
+	{
+		bg_color = RGB (0xFF, 0xC0, 0x00);
+		text_color = RGB (0x00, 0x00, 0x00);
+	}
+	else
+	{
+		bg_color = RGB (0x00, 0x80, 0x40);
+		text_color = RGB (0xFF, 0xFF, 0xFF);
+	}
+
+	// 16px icon: cap the text at 99
+	_r_str_fromulong (text, RTL_NUMBER_OF (text), (percent > 99) ? 99 : percent);
+
+	text_length = (INT)_r_str_getlength (text);
+
+	hscreen = GetDC (NULL);
+
+	if (!hscreen)
+		return NULL;
+
+	hdc = CreateCompatibleDC (hscreen);
+	hbitmap = CreateCompatibleBitmap (hscreen, icon_size, icon_size);
+
+	old_bitmap = SelectObject (hdc, hbitmap);
+
+	SetRect (&rect, 0, 0, icon_size, icon_size);
+
+	hbrush = CreateSolidBrush (bg_color);
+
+	FillRect (hdc, &rect, hbrush);
+
+	DeleteObject (hbrush);
+
+	SetBkMode (hdc, TRANSPARENT);
+	SetTextColor (hdc, text_color);
+
+	// shrink the font until the text fits the icon
+	hfont = NULL;
+	old_font = NULL;
+
+	for (font_height = icon_size - 1; font_height > 5; font_height--)
+	{
+		hfont = CreateFontW (
+			-font_height,
+			0,
+			0,
+			0,
+			FW_BOLD,
+			FALSE,
+			FALSE,
+			FALSE,
+			DEFAULT_CHARSET,
+			OUT_TT_PRECIS,
+			CLIP_DEFAULT_PRECIS,
+			ANTIALIASED_QUALITY,
+			DEFAULT_PITCH | FF_SWISS,
+			L"Tahoma"
+		);
+
+		if (!hfont)
 			continue;
 
-		menu_id = (menu_idx + i);
+		if (old_font)
+			SelectObject (hdc, old_font);
 
-		_r_str_printf (buffer, RTL_NUMBER_OF (buffer), format, menu_value);
+		old_font = SelectObject (hdc, hfont);
 
-		_r_menu_additem (hsubmenu, menu_id, buffer);
-
-		if (!_r_sys_iselevated ())
-			_r_menu_enableitem (hsubmenu, menu_id, FALSE, FALSE);
-
-		if (value == menu_value)
+		if (GetTextExtentPoint32W (hdc, text, text_length, &extent))
 		{
-			_r_menu_checkitem (hsubmenu, menu_id, menu_id, MF_BYCOMMAND, menu_id);
-
-			is_checked = TRUE;
+			if (extent.cx <= (icon_size - 1) && extent.cy <= icon_size)
+				break;
 		}
 
-		menu_items += 1;
+		SelectObject (hdc, old_font);
+
+		DeleteObject (hfont);
+
+		hfont = NULL;
+		old_font = NULL;
 	}
 
-	if (!is_enabled || !is_checked)
-		_r_menu_checkitem (hsubmenu, 0, menu_items + 2, MF_BYPOSITION, 0);
-}
+	DrawTextW (hdc, text, text_length, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-ULONG _app_getlimitvalue ()
-{
-	return _r_calc_clamp (_r_config_getulong (L"AutoreductValue", DEFAULT_AUTOREDUCT_VAL, NULL), 0, 100);
-}
+	if (old_font)
+		SelectObject (hdc, old_font);
 
-ULONG _app_getintervalvalue ()
-{
-	return _r_calc_clamp (_r_config_getulong (L"AutoreductIntervalValue", DEFAULT_AUTOREDUCTINTERVAL_VAL, NULL), 1, 1440);
-}
+	if (hfont)
+		DeleteObject (hfont);
 
-ULONG _app_getdangervalue ()
-{
-	return _r_calc_clamp (_r_config_getulong (L"TrayLevelDanger", DEFAULT_DANGER_LEVEL, NULL), 0, 100);
-}
+	SelectObject (hdc, old_bitmap);
 
-ULONG _app_getwarningvalue ()
-{
-	return _r_calc_clamp (_r_config_getulong (L"TrayLevelWarning", DEFAULT_WARNING_LEVEL, NULL), 0, 100);
-}
+	hbitmap_mask = CreateBitmap (icon_size, icon_size, 1, 1, NULL);
 
-ULONG64 _app_getmemoryinfo (
-	_Out_ PR_MEMORY_INFO mem_info
-)
-{
-	_r_sys_getmemoryinfo (mem_info);
+	icon_info.fIcon = TRUE;
+	icon_info.hbmColor = hbitmap;
+	icon_info.hbmMask = hbitmap_mask;
 
-	return mem_info->physical_memory.used_bytes;
-}
+	hicon = CreateIconIndirect (&icon_info);
 
-FORCEINLINE LPCWSTR _app_getcleanupreason (
-	_In_ CLEANUP_SOURCE_ENUM src
-)
-{
-	switch (src)
-	{
-		case SOURCE_AUTO:
-		{
-			return L"Cleanup (Auto)";
-		}
+	DeleteObject (hbitmap);
+	DeleteObject (hbitmap_mask);
 
-		case SOURCE_MANUAL:
-		{
-			return L"Cleanup (Manual)";
-		}
+	DeleteDC (hdc);
 
-		case SOURCE_HOTKEY:
-		{
-			return L"Cleanup (Hotkey)";
-		}
-
-		case SOURCE_CMDLINE:
-		{
-			return L"Cleanup (Command-line)";
-		}
-
-		default:
-		{
-			return L"Unknown";
-		}
-	}
-}
-
-NTSTATUS _app_flushvolumecache ()
-{
-	PMOUNTMGR_MOUNT_POINTS object_mountpoints;
-	PMOUNTMGR_MOUNT_POINT mountpoint;
-	OBJECT_ATTRIBUTES oa = {0};
-	IO_STATUS_BLOCK isb;
-	UNICODE_STRING us;
-	HANDLE hdevice, hvolume;
-	NTSTATUS status;
-
-	RtlInitUnicodeString (&us, MOUNTMGR_DEVICE_NAME);
-
-	InitializeObjectAttributes (&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-	status = NtCreateFile (
-		&hdevice,
-		FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-		&oa,
-		&isb,
-		NULL,
-		FILE_ATTRIBUTE_NORMAL,
-		FILE_SHARE_READ | FILE_SHARE_WRITE,
-		FILE_OPEN,
-		FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-		NULL,
-		0
-	);
-
-	if (!NT_SUCCESS (status))
-		return status;
-
-	status = _r_fs_getvolumemountpoints (&object_mountpoints, hdevice);
-
-	if (!NT_SUCCESS (status))
-		goto CleanupExit;
-
-	for (ULONG i = 0; i < object_mountpoints->NumberOfMountPoints; i++)
-	{
-		mountpoint = &object_mountpoints->MountPoints[i];
-
-		us.Length = mountpoint->SymbolicLinkNameLength;
-		us.MaximumLength = mountpoint->SymbolicLinkNameLength + sizeof (UNICODE_NULL);
-		us.Buffer = PTR_ADD_OFFSET (object_mountpoints, mountpoint->SymbolicLinkNameOffset);
-
-		if (MOUNTMGR_IS_VOLUME_NAME (&us)) // \\??\\Volume{1111-2222}
-		{
-			InitializeObjectAttributes (&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-			status = NtCreateFile (
-				&hvolume,
-				FILE_WRITE_DATA | SYNCHRONIZE,
-				&oa,
-				&isb,
-				NULL,
-				FILE_ATTRIBUTE_NORMAL,
-				FILE_SHARE_READ | FILE_SHARE_WRITE,
-				FILE_OPEN,
-				FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-				NULL,
-				0
-			);
-
-			if (NT_SUCCESS (status))
-			{
-				status = _r_fs_flushfile (hvolume);
-
-				NtClose (hvolume);
-			}
-		}
-	}
-
-	_r_mem_free (object_mountpoints);
-
-CleanupExit:
-
-	NtClose (hdevice);
-
-	return status;
-}
-
-VOID _app_memoryclean (
-	_In_opt_ HWND hwnd,
-	_In_ CLEANUP_SOURCE_ENUM src,
-	_In_opt_ ULONG mask
-)
-{
-	WCHAR buffer_cleaned_result[0x100] = {0}, buffer_region[0x100] = {0}, buffer_result[0x100] = {0};
-	MEMORY_COMBINE_INFORMATION_EX combine_info_ex = {0};
-	SYSTEM_FILECACHE_INFORMATION sfci = {0};
-	SYSTEM_MEMORY_LIST_COMMAND command;
-	R_MEMORY_INFO mem_info;
-	ULONG64 reduct_after, reduct_before;
-	ULONG flags = NIIF_WARNING;
-	NTSTATUS status;
-
-	if (!_r_config_getboolean (L"IsNotificationsSound", TRUE, NULL))
-		flags |= NIIF_NOSOUND;
-
-	if (!_r_sys_iselevated ())
-	{
-		if (_r_app_runasadmin ())
-		{
-			if (hwnd)
-				DestroyWindow (hwnd);
-		}
-		else
-		{
-			if (src == SOURCE_CMDLINE)
-			{
-				if (hwnd)
-					_r_show_message (hwnd, MB_OK | MB_ICONSTOP, _r_locale_getstring (IDS_STATUS_NOPRIVILEGES), NULL);
-			}
-			else
-			{
-				if (hwnd)
-					_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), _r_locale_getstring (IDS_STATUS_NOPRIVILEGES));
-			}
-		}
-
-		return;
-	}
-
-	if (mask == 0)
-		mask = _r_config_getulong (L"ReductMask2", REDUCT_MASK_DEFAULT, NULL);
-
-	if (src == SOURCE_AUTO)
-	{
-		if (!_r_config_getboolean (L"IsAllowStandbyListCleanup", FALSE, NULL))
-			mask &= ~REDUCT_MASK_FREEZES; // exclude freezes from autoclean feature ;)
-	}
-
-	if ((mask & REDUCT_WORKINGSET) == REDUCT_WORKINGSET)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_WORKINGSET));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_SYSTEMFILECACHE) == REDUCT_SYSTEMFILECACHE)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_SYSTEMFILECACHE));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_MODIFIEDFILECACHE) == REDUCT_MODIFIEDFILECACHE)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_MODIFIEDFILECACHE));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_MODIFIEDLIST) == REDUCT_MODIFIEDLIST)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_MODIFIEDLIST));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"*\r\n");
-	}
-
-	if ((mask & REDUCT_STANDBYLIST) == REDUCT_STANDBYLIST)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_STANDBYLIST));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"*\r\n");
-	}
-
-	if ((mask & REDUCT_STANDBYPRIORITY0LIST) == REDUCT_STANDBYPRIORITY0LIST)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_STANDBYLISTPRIORITY0));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_REGISTRYCACHE) == REDUCT_REGISTRYCACHE)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_appendformat (buffer_region, RTL_NUMBER_OF (buffer_region), L"%s (win8.1+)", _r_locale_getstring (IDS_MEMREGION_REGISTRYCACHE));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_COMBINEMEMORYLISTS) == REDUCT_COMBINEMEMORYLISTS)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_appendformat (buffer_region, RTL_NUMBER_OF (buffer_region), L"%s (win10+)", _r_locale_getstring (IDS_MEMREGION_COMBINEMEMORYLISTS));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	StrTrimW (buffer_region, L"\r\n");
-
-	if (src == SOURCE_MANUAL)
-	{
-		if (!_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_QUESTION), buffer_region, L"IsShowReductConfirmation", FALSE))
-			return;
-	}
-
-	SetCursor (LoadCursorW (NULL, IDC_WAIT));
-
-	// difference (before)
-	reduct_before = _app_getmemoryinfo (&mem_info);
-
-	// Working set (vista+)
-	if ((mask & REDUCT_WORKINGSET) == REDUCT_WORKINGSET)
-	{
-		command = MemoryEmptyWorkingSets;
-
-		status = NtSetSystemInformation (SystemMemoryListInformation, &command, sizeof (SYSTEM_MEMORY_LIST_COMMAND));
-
-		if (!NT_SUCCESS (status))
-			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", L"MemoryEmptyWorkingSets", status);
-	}
-
-	// System file cache
-	if ((mask & REDUCT_SYSTEMFILECACHE) == REDUCT_SYSTEMFILECACHE)
-	{
-		sfci.MinimumWorkingSet = MAXSIZE_T;
-		sfci.MaximumWorkingSet = MAXSIZE_T;
-
-		status = NtSetSystemInformation (SystemFileCacheInformationEx, &sfci, sizeof (SYSTEM_FILECACHE_INFORMATION));
-
-		if (!NT_SUCCESS (status))
-			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", L"SystemFileCacheInformation", status);
-	}
-
-	// Flush volume cache
-	if ((mask & REDUCT_MODIFIEDFILECACHE) == REDUCT_MODIFIEDFILECACHE)
-		_app_flushvolumecache ();
-
-	// Modified page list (vista+)
-	if ((mask & REDUCT_MODIFIEDLIST) == REDUCT_MODIFIEDLIST)
-	{
-		command = MemoryFlushModifiedList;
-
-		status = NtSetSystemInformation (SystemMemoryListInformation, &command, sizeof (SYSTEM_MEMORY_LIST_COMMAND));
-
-		if (!NT_SUCCESS (status))
-			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", L"MemoryFlushModifiedList", status);
-	}
-
-	// Standby list (vista+)
-	if ((mask & REDUCT_STANDBYLIST) == REDUCT_STANDBYLIST)
-	{
-		command = MemoryPurgeStandbyList;
-
-		status = NtSetSystemInformation (SystemMemoryListInformation, &command, sizeof (SYSTEM_MEMORY_LIST_COMMAND));
-
-		if (!NT_SUCCESS (status))
-			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", L"MemoryPurgeStandbyList", status);
-	}
-
-	// Standby priority-0 list (vista+)
-	if ((mask & REDUCT_STANDBYPRIORITY0LIST) == REDUCT_STANDBYPRIORITY0LIST)
-	{
-		command = MemoryPurgeLowPriorityStandbyList;
-
-		status = NtSetSystemInformation (SystemMemoryListInformation, &command, sizeof (SYSTEM_MEMORY_LIST_COMMAND));
-
-		if (!NT_SUCCESS (status))
-			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", L"MemoryPurgeLowPriorityStandbyList", status);
-	}
-
-	// Flush registry cache (win8.1+)
-	if (_r_sys_isosversiongreaterorequal (WINDOWS_8_1) && (mask & REDUCT_REGISTRYCACHE) == REDUCT_REGISTRYCACHE)
-	{
-		status = NtSetSystemInformation (SystemRegistryReconciliationInformation, NULL, 0);
-
-		if (!NT_SUCCESS (status))
-			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", L"SystemRegistryReconciliationInformation", status);
-	}
-
-	// Combine memory lists (win10+)
-	if (_r_sys_isosversiongreaterorequal (WINDOWS_10) && (mask & REDUCT_COMBINEMEMORYLISTS) == REDUCT_COMBINEMEMORYLISTS)
-	{
-		status = NtSetSystemInformation (SystemCombinePhysicalMemoryInformation, &combine_info_ex, sizeof (MEMORY_COMBINE_INFORMATION_EX));
-
-		if (!NT_SUCCESS (status))
-			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", L"SystemCombinePhysicalMemoryInformation", status);
-	}
-
-	SetCursor (LoadCursorW (NULL, IDC_ARROW));
-
-	// difference (after)
-	reduct_after = _app_getmemoryinfo (&mem_info);
-
-	reduct_after = (reduct_after < reduct_before) ? (reduct_before - reduct_after) : 0;
-
-	// time of last cleaning
-	_r_config_setlong64 (L"StatisticLastReduct", _r_unixtime_now (), NULL);
-
-	_r_format_bytesize64 (buffer_cleaned_result, RTL_NUMBER_OF (buffer_cleaned_result), reduct_after);
-
-	_r_str_printf (buffer_result, RTL_NUMBER_OF (buffer_result), _r_locale_getstring (IDS_STATUS_CLEANED), buffer_cleaned_result);
-	_r_str_printf (buffer_result, RTL_NUMBER_OF (buffer_result), L"%s\r\n\r\n%s:\r\n%s", buffer_result, _r_locale_getstring (IDS_TITLE_3), buffer_region);
-
-	if (src == SOURCE_CMDLINE)
-	{
-		if (_r_config_getboolean (L"BalloonCleanResults", TRUE, NULL))
-		{
-			if (!_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), buffer_result))
-				_r_show_message (hwnd, MB_OK | MB_ICONINFORMATION, _r_locale_getstring (IDS_SETTINGS_MEMORY), buffer_result);
-		}
-		else
-		{
-			_r_show_message (hwnd, MB_OK | MB_ICONINFORMATION, _r_locale_getstring (IDS_SETTINGS_MEMORY), buffer_result);
-		}
-	}
-	else
-	{
-		if (hwnd && _r_config_getboolean (L"BalloonCleanResults", TRUE, NULL))
-			_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), buffer_result);
-	}
-
-	if (_r_config_getboolean (L"LogCleanResults", FALSE, NULL))
-		_r_log_v (LOG_LEVEL_INFO, NULL, _app_getcleanupreason (src), 0, buffer_cleaned_result);
-}
-
-VOID _app_fontinit (
-	_Out_ PLOGFONT logfont,
-	_In_ LONG dpi_value
-)
-{
-	RtlZeroMemory (logfont, sizeof (LOGFONT));
-
-	_r_str_copy (logfont->lfFaceName, LF_FACESIZE, L"Lucida Console");
-
-	logfont->lfHeight = _r_dc_fontsizetoheight (8, dpi_value);
-	logfont->lfWeight = FW_NORMAL;
-
-	_r_config_getfont (L"TrayFont", logfont, dpi_value, NULL);
-
-	logfont->lfCharSet = DEFAULT_CHARSET;
-	logfont->lfQuality = _r_config_getboolean (L"TrayUseAntialiasing", FALSE, NULL) ? CLEARTYPE_QUALITY : NONANTIALIASED_QUALITY;
-}
-
-VOID _app_drawbackground (
-	_In_ HDC hdc,
-	_In_ COLORREF bg_clr,
-	_In_ COLORREF pen_clr,
-	_In_ COLORREF brush_clr,
-	_In_ LPCRECT rect,
-	_In_ BOOLEAN is_round
-)
-{
-	HGDIOBJ prev_brush, prev_pen;
-	COLORREF prev_clr;
-
-	prev_brush = SelectObject (hdc, GetStockObject (DC_BRUSH));
-	prev_pen = SelectObject (hdc, GetStockObject (DC_PEN));
-
-	prev_clr = SetBkColor (hdc, bg_clr);
-
-	SetDCPenColor (hdc, pen_clr);
-	SetDCBrushColor (hdc, brush_clr);
-
-	_r_dc_fillrect (hdc, rect, bg_clr);
-
-	if (is_round)
-	{
-		RoundRect (hdc, rect->left, rect->top, rect->right, rect->bottom, rect->right - 2, rect->right / 2);
-	}
-	else
-	{
-		Rectangle (hdc, rect->left, rect->top, rect->right, rect->bottom);
-	}
-
-	SelectObject (hdc, prev_brush);
-	SelectObject (hdc, prev_pen);
-
-	SetBkColor (hdc, prev_clr);
-}
-
-HICON _app_iconcreate (
-	_In_opt_ ULONG percent
-)
-{
-	static HICON hicon = NULL;
-
-	R_MEMORY_INFO mem_info;
-	WCHAR icon_text[0x08];
-	ICONINFO ii = {0};
-	R_STRINGREF sr;
-	HGDIOBJ prev_bmp, prev_font;
-	HICON hicon_new;
-	COLORREF bg_color, text_color;
-	INT prev_mode;
-	BOOLEAN is_border, is_round, is_transparent, has_danger;
-
-	text_color = _r_config_getulong (L"TrayColorText", TRAY_COLOR_TEXT, NULL);
-	bg_color = _r_config_getulong (L"TrayColorBg", TRAY_COLOR_BG, NULL);
-
-	is_transparent = _r_config_getboolean (L"TrayUseTransparency", FALSE, NULL);
-	is_border = _r_config_getboolean (L"TrayShowBorder", FALSE, NULL);
-	is_round = _r_config_getboolean (L"TrayRoundCorners", FALSE, NULL);
-
-	if (percent == 0)
-	{
-		_app_getmemoryinfo (&mem_info);
-
-		percent = mem_info.physical_memory.percent;
-	}
-
-	has_danger = (percent >= _app_getdangervalue ());
-
-	if (has_danger || percent >= _app_getwarningvalue ())
-	{
-		if (_r_config_getboolean (L"TrayChangeBg", TRUE, NULL))
-		{
-			bg_color = has_danger ? _r_config_getulong (L"TrayColorDanger", TRAY_COLOR_DANGER, NULL) : _r_config_getulong (L"TrayColorWarning", TRAY_COLOR_WARNING, NULL);
-
-			is_transparent = FALSE;
-		}
-		else
-		{
-			text_color = has_danger ? _r_config_getulong (L"TrayColorDanger", TRAY_COLOR_DANGER, NULL) : _r_config_getulong (L"TrayColorWarning", TRAY_COLOR_WARNING, NULL);
-		}
-	}
-
-	// set tray text
-	_r_str_fromulong (icon_text, RTL_NUMBER_OF (icon_text), percent);
-
-	_r_obj_initializestringref (&sr, icon_text);
-
-	// draw main device context
-	prev_bmp = SelectObject (config.hdc, config.hbitmap);
-	prev_font = SelectObject (config.hdc, config.hfont);
-	prev_mode = SetBkMode (config.hdc, TRANSPARENT);
-
-	_app_drawbackground (config.hdc, bg_color, is_border ? text_color : bg_color, is_transparent ? text_color : bg_color, &config.icon_size, is_round);
-
-	_r_dc_drawtext (NULL, config.hdc, &sr, &config.icon_size, 0, 0, DT_VCENTER | DT_CENTER | DT_SINGLELINE | DT_NOCLIP | DT_NOPREFIX, text_color);
-
-	SetBkMode (config.hdc, prev_mode);
-
-	SelectObject (config.hdc, prev_font);
-	SelectObject (config.hdc, prev_bmp);
-
-	// draw mask device context
-	prev_bmp = SelectObject (config.hdc_mask, config.hbitmap_mask);
-	prev_font = SelectObject (config.hdc_mask, config.hfont);
-	prev_mode = SetBkMode (config.hdc_mask, TRANSPARENT);
-
-	_app_drawbackground (config.hdc_mask, TRAY_COLOR_WHITE, is_border ? TRAY_COLOR_BLACK : TRAY_COLOR_WHITE, is_transparent ? TRAY_COLOR_WHITE : TRAY_COLOR_BLACK, &config.icon_size, is_round);
-
-	_r_dc_drawtext (NULL, config.hdc_mask, &sr, &config.icon_size, 0, 0, DT_VCENTER | DT_CENTER | DT_SINGLELINE | DT_NOCLIP | DT_NOPREFIX, TRAY_COLOR_BLACK);
-
-	SetBkMode (config.hdc_mask, prev_mode);
-
-	SelectObject (config.hdc_mask, prev_bmp);
-	SelectObject (config.hdc_mask, prev_font);
-
-	// create icon
-	ii.hbmMask = config.hbitmap_mask;
-	ii.hbmColor = config.hbitmap;
-	ii.fIcon = TRUE;
-
-	hicon_new = CreateIconIndirect (&ii);
-
-	if (hicon)
-		DestroyIcon (hicon);
-
-	hicon = hicon_new;
+	ReleaseDC (NULL, hscreen);
 
 	return hicon;
 }
 
-VOID CALLBACK _app_timercallback (
-	_In_ HWND hwnd,
-	_In_ UINT msg,
-	_In_ UINT_PTR id_event,
-	_In_ ULONG time
-)
+// update the tray icon when the percentage changes
+static VOID _app_seticon (HWND hwnd, ULONG percent)
 {
-	R_MEMORY_INFO mem_info;
-	WCHAR buffer[0x80];
-	HICON hicon = NULL;
-	LONG64 timestamp;
-	ULONG percent;
-	BOOLEAN is_clean = FALSE;
+	HICON hicon;
+	LPCWSTR stage;
+	ULONG warning_level, danger_level;
 
-	if (id_event != UID)
+	if (percent == tray_percent && tray_icon)
 		return;
 
-	_app_getmemoryinfo (&mem_info);
+	hicon = _app_createicon (percent);
 
-	// autocleanup functional
-	if (_r_sys_iselevated ())
+	if (!hicon)
+		return;
+
+	if (tray_icon)
+		DestroyIcon (tray_icon);
+
+	tray_icon = hicon;
+	tray_percent = percent;
+
+	_app_gettraylevels (&warning_level, &danger_level);
+
+	if (percent >= danger_level)
+		stage = L_STAGE_TIGHT;
+	else if (percent >= warning_level)
+		stage = L_STAGE_BUSY;
+	else
+		stage = L_STAGE_FREE;
+
+	_r_tray_setinfoformat (hwnd, &GUID_TRAYICON, tray_icon, L"%s: %lu%% (%s)", L_MEM_USAGE, percent, stage);
+}
+
+// localized user interface
+static VOID _app_localize (HWND hwnd)
+{
+	SetWindowTextW (hwnd, L_APP_TITLE);
+
+	_r_ctrl_setstring (hwnd, IDC_CLEAN, L_BTN_CLEAN);
+	_r_ctrl_setstring (hwnd, IDC_AUTO_CHK, L_AUTO_ENABLE);
+	_r_ctrl_setstring (hwnd, IDC_AUTO_SUFFIX, L_AUTO_SUFFIX);
+	_r_ctrl_setstring (hwnd, IDC_SFC_CHK, L_SFC_ENABLE);
+	_r_ctrl_setstring (hwnd, IDC_AUTO_WARN, L_AUTO_WARN);
+	_r_ctrl_setstring (hwnd, IDC_WL_EDIT, L_WL_EDIT);
+	_r_ctrl_setstring (hwnd, IDC_HINT, L_HINT);
+}
+
+// refresh memory and whitelist status
+static VOID _app_updateui (HWND hwnd)
+{
+	R_MEMORY_INFO mem_info;
+	WCHAR buffer[0x100], used_buffer[0x40], total_buffer[0x40], free_buffer[0x40];
+
+	_r_sys_getmemoryinfo (&mem_info);
+
+	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s: %lu%%", L_MEM_USAGE, (ULONG)mem_info.physical_memory.percent);
+
+	_r_ctrl_setstring (hwnd, IDC_INFO_MEM, buffer);
+
+	_r_format_bytesize64 (used_buffer, (UINT)RTL_NUMBER_OF (used_buffer), mem_info.physical_memory.used_bytes);
+	_r_format_bytesize64 (total_buffer, (UINT)RTL_NUMBER_OF (total_buffer), mem_info.physical_memory.total_bytes);
+	_r_format_bytesize64 (free_buffer, (UINT)RTL_NUMBER_OF (free_buffer), mem_info.physical_memory.free_bytes);
+
+	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s %s / %s    %s %s", L_TOTAL, used_buffer, total_buffer, L_FREE, free_buffer);
+
+	_r_ctrl_setstring (hwnd, IDC_INFO_DETAIL, buffer);
+
+	if (!_wl_isfileexists ())
+		_r_str_copy (buffer, RTL_NUMBER_OF (buffer), L_WL_MISSING);
+	else if (_wl_getcount () == 0)
+		_r_str_copy (buffer, RTL_NUMBER_OF (buffer), L_WL_EMPTY);
+	else
+		_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L_WL_LOADED, (ULONG)_wl_getcount ());
+
+	_r_ctrl_setstring (hwnd, IDC_WL_INFO, buffer);
+
+	_app_seticon (hwnd, (ULONG)mem_info.physical_memory.percent);
+}
+
+// load persisted settings into the dialog
+static VOID _app_loadsettings (HWND hwnd)
+{
+	WCHAR buffer[0x20];
+	ULONG percent, is_autoclean;
+
+	percent = _app_getautocleanpercent ();
+
+	// write back the clamped value so a stale/hand-edited ini gets corrected
+	_app_setconfig (L"AutoCleanPercent", percent);
+
+	_r_str_fromulong (buffer, RTL_NUMBER_OF (buffer), percent);
+
+	SetWindowTextW (GetDlgItem (hwnd, IDC_AUTO_VALUE_CTRL), buffer);
+
+	is_autoclean = _app_getconfig (L"AutoClean", 0);
+
+	SendMessageW (GetDlgItem (hwnd, IDC_AUTO_CHK), BM_SETCHECK, is_autoclean ? BST_CHECKED : BST_UNCHECKED, 0);
+	SendMessageW (GetDlgItem (hwnd, IDC_SFC_CHK), BM_SETCHECK, _app_getconfig (L"CleanSystemCache", 0) ? BST_CHECKED : BST_UNCHECKED, 0);
+
+	EnableWindow (GetDlgItem (hwnd, IDC_AUTO_VALUE_CTRL), is_autoclean ? TRUE : FALSE);
+
+	// persist the validated tray stages and show them as a legend
 	{
-		if (_r_config_getboolean (L"AutoreductEnable", FALSE, NULL))
-		{
-			if (mem_info.physical_memory.percent >= _app_getlimitvalue ())
-			{
-				// cooldown prevents cleaning loop when memory usage stays above the limit (issue #191)
-				timestamp = _r_unixtime_now () - _r_config_getlong64 (L"StatisticLastReduct", 0, NULL);
+		ULONG warning_level, danger_level;
+		WCHAR legend[0x100];
 
-				if (timestamp >= AUTOREDUCT_COOLDOWN)
-					is_clean = TRUE;
+		_app_gettraylevels (&warning_level, &danger_level);
+
+		_app_setconfig (L"TrayWarningPercent", warning_level);
+		_app_setconfig (L"TrayDangerPercent", danger_level);
+
+		_r_str_printf (
+			legend,
+			RTL_NUMBER_OF (legend),
+			L_LEGEND,
+			warning_level,
+			warning_level,
+			danger_level - 1,
+			danger_level
+		);
+
+		_r_ctrl_setstring (hwnd, IDC_LEGEND, legend);
+	}
+
+	_app_updateautowarn (hwnd);
+}
+
+// log file path in the temporary directory
+static VOID _app_getlogpath (LPWSTR buffer, ULONG_PTR buffer_length)
+{
+	WCHAR directory[0x400];
+
+	if (GetTempPathW (RTL_NUMBER_OF (directory), directory) == 0)
+	{
+		_r_str_copy (buffer, buffer_length, L_LOG_FILENAME);
+
+		return;
+	}
+
+	_r_str_printf (buffer, buffer_length, L"%s%s", directory, L_LOG_FILENAME);
+}
+
+// 64-bit FNV-1a, used for log de-duplication
+#define LOG_HASH_BASIS 14695981039346656037ULL
+#define LOG_HASH_PRIME 1099511628211ULL
+#define LOG_REPEAT_LIMIT 30
+#define LOG_MAX_SIZE (512 * 1024)
+
+static ULONG64 last_entry_code = 0;
+static ULONG64 last_failure_code = 0;
+static ULONG suppressed_count = 0;
+
+static ULONG64 _app_hash64 (ULONG64 hash, LPCVOID data, ULONG_PTR length)
+{
+	PBYTE bytes = (PBYTE)data;
+
+	for (ULONG_PTR i = 0; i < length; i++)
+	{
+		hash ^= bytes[i];
+		hash *= LOG_HASH_PRIME;
+	}
+
+	return hash;
+}
+
+// cleanup report; duplicate entries collapse into repeats=N
+static VOID _app_writelog (PMT_STATS stats, ULONG64 freed_bytes, BOOLEAN is_auto)
+{
+	SYSTEMTIME time = {0};
+	WCHAR path_buffer[0x400];
+	WCHAR entry[0x200];
+	WCHAR buffer[0x900];
+	PBYTE utf8_buffer;
+	HANDLE hfile;
+	LARGE_INTEGER file_size = {0};
+	DWORD written = 0;
+	INT utf8_length;
+	ULONG fail_count, i;
+	ULONG64 entry_code, failure_code;
+	BOOLEAN is_newfailures;
+	BOOLEAN is_sameentry;
+
+	_app_getlogpath (path_buffer, RTL_NUMBER_OF (path_buffer));
+
+	if (!_app_getconfig (L"LogEnable", 1))
+		return;
+
+	// failure set signature
+	fail_count = _mt_getfailurecount ();
+	failure_code = LOG_HASH_BASIS;
+
+	for (i = 0; i < fail_count; i++)
+	{
+		WCHAR name[0x40];
+		ULONG pid = 0;
+		LONG status = 0;
+
+		if (!_mt_getfailure (i, &pid, name, RTL_NUMBER_OF (name), &status))
+			continue;
+
+		failure_code = _app_hash64 (failure_code, name, _r_str_getlength (name) * sizeof (WCHAR));
+		failure_code = _app_hash64 (failure_code, &pid, sizeof (pid));
+		failure_code = _app_hash64 (failure_code, &status, sizeof (status));
+	}
+
+	// entry body without the timestamp
+	_r_str_printf (
+		entry,
+		RTL_NUMBER_OF (entry),
+		L"mode=%s limit=%lu%% released=%lu KB trimmed=%lu skip_wl=%lu skip_sys=%lu skip_unknown=%lu protected=%lu failed=%lu",
+		is_auto ? L"auto" : L"manual",
+		_app_getautocleanpercent (),
+		(ULONG)(freed_bytes / 1024),
+		stats->trimmed,
+		stats->skipped_whitelist,
+		stats->skipped_system,
+		stats->skipped_unknown,
+		stats->protected_count,
+		stats->failed
+	);
+
+	entry_code = _app_hash64 (LOG_HASH_BASIS, entry, _r_str_getlength (entry) * sizeof (WCHAR));
+
+	is_newfailures = (failure_code != last_failure_code);
+	is_sameentry = (entry_code == last_entry_code) && !is_newfailures;
+
+	if (is_sameentry)
+	{
+		suppressed_count++;
+
+		// identical line and unchanged failures: nothing worth logging
+		if (suppressed_count < LOG_REPEAT_LIMIT)
+			return;
+	}
+
+	GetLocalTime (&time);
+
+	hfile = CreateFileW (path_buffer, FILE_APPEND_DATA | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+	if (hfile == INVALID_HANDLE_VALUE)
+		return;
+
+	// keep the log small
+	if (GetFileSizeEx (hfile, &file_size) && file_size.QuadPart > LOG_MAX_SIZE)
+	{
+		NtClose (hfile);
+
+		hfile = CreateFileW (path_buffer, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+		if (hfile == INVALID_HANDLE_VALUE)
+			return;
+	}
+
+	_r_str_printf (
+		buffer,
+		RTL_NUMBER_OF (buffer),
+		L"[%04lu-%02lu-%02lu %02lu:%02lu:%02lu] %s",
+		(ULONG)time.wYear,
+		(ULONG)time.wMonth,
+		(ULONG)time.wDay,
+		(ULONG)time.wHour,
+		(ULONG)time.wMinute,
+		(ULONG)time.wSecond,
+		entry
+	);
+
+	if (suppressed_count > 0)
+		_r_str_appendformat (buffer, RTL_NUMBER_OF (buffer), L" repeats=%lu", suppressed_count + 1);
+
+	_r_str_append (buffer, RTL_NUMBER_OF (buffer), L"\r\n");
+
+	if (is_newfailures)
+	{
+		for (i = 0; i < fail_count; i++)
+		{
+			WCHAR name[0x40];
+			ULONG pid = 0;
+			LONG status = 0;
+
+			if (!_mt_getfailure (i, &pid, name, RTL_NUMBER_OF (name), &status))
+				continue;
+
+			_r_str_appendformat (buffer, RTL_NUMBER_OF (buffer), L"    fail: %s pid=%lu status=0x%08lX\r\n", name, pid, (ULONG)status);
+		}
+
+		last_failure_code = failure_code;
+	}
+
+	utf8_length = WideCharToMultiByte (CP_UTF8, 0, buffer, -1, NULL, 0, NULL, NULL);
+
+	if (utf8_length > 1)
+	{
+		utf8_buffer = _r_mem_allocate ((ULONG_PTR)utf8_length);
+		WideCharToMultiByte (CP_UTF8, 0, buffer, -1, (LPSTR)utf8_buffer, utf8_length, NULL, NULL);
+
+		WriteFile (hfile, utf8_buffer, (DWORD)(utf8_length - 1), &written, NULL);
+
+		_r_mem_free (utf8_buffer);
+	}
+
+	NtClose (hfile);
+
+	last_entry_code = entry_code;
+	suppressed_count = 0;
+}
+
+// perform the cleanup
+static VOID _app_clean (HWND hwnd, BOOLEAN is_auto)
+{
+	MT_OPTIONS options = {0};
+	MT_STATS stats = {0};
+	R_MEMORY_INFO mem_info;
+	WCHAR buffer[0x200], size_buffer[0x40];
+	ULONG64 freed_bytes;
+	ULONG regions;
+
+	if (hwnd)
+		_r_ctrl_setstring (hwnd, IDC_RESULT, L_CLEANING);
+
+	// reload the whitelist on every run so edits take effect immediately
+	if (!_wl_load ())
+	{
+		// fail closed: a missing or unreadable whitelist must never allow a full cleanup
+		if (!_wl_isfileexists ())
+			_wl_createtemplate ();
+
+		_wl_lockfile ();
+		_wl_load ();
+
+		if (hwnd)
+		{
+			_r_ctrl_setstring (hwnd, IDC_RESULT, L_BLOCK_NOWLFILE);
+
+			if (!is_blockedhintshown)
+			{
+				_r_tray_popup (hwnd, &GUID_TRAYICON, NIIF_WARNING, L_APP_TITLE, L_BLOCK_NOWLFILE);
+
+				is_blockedhintshown = TRUE;
 			}
 		}
 
-		if (!is_clean && _r_config_getboolean (L"AutoreductIntervalEnable", FALSE, NULL))
-		{
-			timestamp = _r_unixtime_now () - _r_config_getlong64 (L"StatisticLastReduct", 0, NULL);
+		// throttle the next attempt, otherwise a blocked cleanup retries every tick
+		last_clean_time = (ULONG)_r_unixtime_now ();
 
-			if (timestamp >= (_app_getintervalvalue () * 60))
-				is_clean = TRUE;
-		}
+		_app_updateui (hwnd);
 
-		if (is_clean)
-			_app_memoryclean (hwnd, SOURCE_AUTO, 0);
-	}
-
-	// check previous percent to prevent icon redraw
-	if (!config.ms_prev || config.ms_prev != mem_info.physical_memory.percent)
-	{
-		config.ms_prev = mem_info.physical_memory.percent; // store last percentage value (required!)
-
-		hicon = _app_iconcreate (config.ms_prev);
-	}
-
-	_r_tray_setinfoformat (
-		hwnd,
-		&GUID_TrayIcon,
-		hicon,
-		L"%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%",
-		_r_locale_getstring (IDS_GROUP_1),
-		mem_info.physical_memory.percent_f,
-		_r_locale_getstring (IDS_GROUP_2),
-		mem_info.page_file.percent_f,
-		_r_locale_getstring (IDS_GROUP_3),
-		mem_info.system_cache.percent_f
-	);
-
-	if (!_r_wnd_isvisible (hwnd, FALSE))
 		return;
-
-	// set item lparam information
-	for (INT i = 0; i < _r_listview_getitemcount (hwnd, IDC_LISTVIEW); i++)
-	{
-		if (i < 3)
-		{
-			percent = mem_info.physical_memory.percent;
-		}
-		else if (i < 6)
-		{
-			percent = mem_info.page_file.percent;
-		}
-		else if (i < 9)
-		{
-			percent = mem_info.system_cache.percent;
-		}
-
-		_r_listview_setitem (hwnd, IDC_LISTVIEW, i, 0, NULL, I_DEFAULT, I_DEFAULT, (LPARAM)percent);
 	}
 
-	// physical memory
-	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%" TEXT (PR_DOUBLE) L"%%", mem_info.physical_memory.percent_f);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 0, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	if (_wl_getcount () == 0 && !_app_getconfig (L"AllowEmptyWhitelist", 0))
+	{
+		// fail closed: an empty whitelist means "everything is protected"
+		if (hwnd)
+		{
+			_r_ctrl_setstring (hwnd, IDC_RESULT, L_BLOCK_EMPTYWL);
 
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.physical_memory.free_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 1, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+			if (!is_blockedhintshown)
+			{
+				_r_tray_popup (hwnd, &GUID_TRAYICON, NIIF_WARNING, L_APP_TITLE, L_BLOCK_EMPTYWL);
 
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.physical_memory.total_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 2, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+				is_blockedhintshown = TRUE;
+			}
+		}
 
-	// pagefile
-	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%" TEXT (PR_DOUBLE) L"%%", mem_info.page_file.percent_f);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 3, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+		// throttle the next attempt, otherwise a blocked cleanup retries every tick
+		last_clean_time = (ULONG)_r_unixtime_now ();
 
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.page_file.free_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 4, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+		_app_updateui (hwnd);
 
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.page_file.total_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 5, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+		return;
+	}
 
-	// system cache
-	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%" TEXT (PR_DOUBLE) L"%%", mem_info.system_cache.percent_f);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 6, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	options.is_skipsystem = TRUE;
+	options.is_skipunknown = TRUE;
+	options.is_inheritchildren = TRUE;
+	options.is_protectwhitelist = TRUE;
+	options.is_usecompress = TRUE;
 
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.system_cache.free_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 7, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	_r_sys_getmemoryinfo (&mem_info);
 
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.system_cache.total_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 8, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	stats.bytes_before = mem_info.physical_memory.used_bytes;
 
-	_r_listview_redraw (hwnd, IDC_LISTVIEW);
-}
+	_mt_cleanprocesses (&options, &stats);
 
-VOID _app_iconredraw (
-	_In_opt_ HWND hwnd
-)
-{
-	config.ms_prev = 0;
+	regions = MT_REGION_MODIFIEDLIST | MT_REGION_STANDBYLOWPRIORITY | MT_REGION_COMBINEMEMORYLISTS | MT_REGION_REGISTRYCACHE;
+
+	if (_app_getconfig (L"CleanSystemCache", 0))
+		regions |= MT_REGION_SYSTEMFILECACHE;
+
+	_mt_globalclean (regions);
+
+	// restore working set quotas of whitelisted processes
+	_mt_restorewhitelist ();
+
+	_r_sys_getmemoryinfo (&mem_info);
+
+	stats.bytes_after = mem_info.physical_memory.used_bytes;
+
+	freed_bytes = (stats.bytes_before > stats.bytes_after) ? (stats.bytes_before - stats.bytes_after) : 0;
+
+	_r_format_bytesize64 (size_buffer, (UINT)RTL_NUMBER_OF (size_buffer), freed_bytes);
+
+	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L_RESULT, size_buffer, stats.trimmed, stats.skipped_whitelist, stats.failed);
+
+	// append the failed process names for the first few failures
+	{
+		WCHAR fail_buffer[0x200] = {0};
+		ULONG fail_count = _mt_getfailurecount ();
+
+		for (ULONG i = 0; i < fail_count && i < 4; i++)
+		{
+			WCHAR name[0x40];
+			ULONG pid = 0;
+
+			if (!_mt_getfailure (i, &pid, name, RTL_NUMBER_OF (name), NULL))
+				continue;
+
+			if (fail_buffer[0] != UNICODE_NULL)
+				_r_str_append (fail_buffer, RTL_NUMBER_OF (fail_buffer), L"  ");
+
+			_r_str_appendformat (fail_buffer, RTL_NUMBER_OF (fail_buffer), L"%s(%lu)", name, pid);
+		}
+
+		if (fail_buffer[0] != UNICODE_NULL)
+			_r_str_appendformat (buffer, RTL_NUMBER_OF (buffer), L"\r\n%s%s\r\n%s", L_FAIL_LABEL, fail_buffer, L_FAIL_TIP);
+	}
+
+	_app_writelog (&stats, freed_bytes, is_auto);
 
 	if (hwnd)
-		_app_timercallback (hwnd, 0, UID, 0);
+	{
+		_r_ctrl_setstring (hwnd, IDC_RESULT, buffer);
+
+		if (!is_auto)
+			_r_tray_popup (hwnd, &GUID_TRAYICON, NIIF_INFO, L_APP_TITLE, buffer);
+	}
+
+	last_clean_time = (ULONG)_r_unixtime_now ();
+
+	// disarm until usage drops below threshold or the timer fires
+	is_autoclean_armed = FALSE;
+	is_blockedhintshown = FALSE;
+
+	_app_updateui (hwnd);
 }
 
-VOID _app_iconinit (
-	_In_ LONG dpi_value
-)
+// tray context menu
+static VOID _app_showtraymenu (HWND hwnd)
 {
-	LOGFONT logfont;
-	PVOID bits;
-	HDC hdc;
+	HMENU hmenu;
+	POINT pt;
 
-	SAFE_DELETE_OBJECT (config.hbitmap_mask);
-	SAFE_DELETE_OBJECT (config.hbitmap);
-	SAFE_DELETE_OBJECT (config.hfont);
+	hmenu = CreatePopupMenu ();
 
-	SAFE_DELETE_DC (config.hdc_mask);
-	SAFE_DELETE_DC (config.hdc);
-
-	// init font
-	_app_fontinit (&logfont, dpi_value);
-
-	config.hfont = CreateFontIndirectW (&logfont);
-
-	// init rect
-	SetRect (&config.icon_size, 0, 0, _r_dc_getsystemmetrics (SM_CXSMICON, dpi_value), _r_dc_getsystemmetrics (SM_CYSMICON, dpi_value));
-
-	// init dc
-	hdc = GetDC (NULL);
-
-	if (!hdc)
+	if (!hmenu)
 		return;
 
-	config.hdc = CreateCompatibleDC (hdc);
-	config.hdc_mask = CreateCompatibleDC (hdc);
+	AppendMenuW (hmenu, MF_STRING, IDM_TRAY_SHOW, L_TRAY_SHOW);
+	AppendMenuW (hmenu, MF_STRING, IDM_TRAY_CLEAN, L_TRAY_CLEAN);
+	AppendMenuW (hmenu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW (hmenu, MF_STRING, IDM_TRAY_EXIT, L_TRAY_EXIT);
 
-	// init bitmap
-	config.hbitmap = _r_dc_createbitmap (hdc, config.icon_size.right, config.icon_size.bottom, &bits);
-	config.hbitmap_mask = CreateBitmap (config.icon_size.right, config.icon_size.bottom, 1, 1, NULL);
+	GetCursorPos (&pt);
 
-	ReleaseDC (NULL, hdc);
+	SetForegroundWindow (hwnd);
+
+	TrackPopupMenu (hmenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, NULL);
+
+	DestroyMenu (hmenu);
 }
 
-VOID _app_hotkeyinit (
-	_In_ HWND hwnd
-)
-{
-	LONG hotkey;
-
-	UnregisterHotKey (hwnd, UID);
-
-	if (!_r_config_getboolean (L"HotkeyCleanEnable", FALSE, NULL))
-		return;
-
-	hotkey = _r_config_getlong (L"HotkeyClean", MAKEWORD (VK_F1, HOTKEYF_CONTROL), NULL);
-
-	if (!hotkey)
-		return;
-
-	if (!RegisterHotKey (hwnd, UID, (HIBYTE (hotkey) & 2) | ((HIBYTE (hotkey) & 4) >> 2) | ((HIBYTE (hotkey) & 1) << 2), LOBYTE (hotkey)))
-		_r_show_errormessage (hwnd, L"Could not register hotkey!", NULL, NtLastError (), ET_WINDOWS);
-}
-
-FORCEINLINE VOID _app_setfontcontrol (
-	_In_ HWND hwnd,
-	_In_ INT ctrl_id,
-	_In_ PLOGFONT logfont,
-	_In_ LONG dpi_value
-)
-{
-	_r_ctrl_setstringformat (hwnd, IDC_FONT, L"%s, %" TEXT (PR_LONG) L"px, %" TEXT (PR_LONG), logfont->lfFaceName, _r_dc_fontheighttosize (logfont->lfHeight, dpi_value), logfont->lfWeight);
-}
-
-INT_PTR CALLBACK SettingsProc (
-	_In_ HWND hwnd,
-	_In_ UINT msg,
-	_In_ WPARAM wparam,
-	_In_ LPARAM lparam
-)
+INT_PTR CALLBACK DlgProc (HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
 	switch (msg)
 	{
-		case RM_INITIALIZE:
+		case WM_INITDIALOG:
 		{
-			INT dialog_id = (INT)wparam;
+			ULONG privileges[] = {
+				SE_DEBUG_PRIVILEGE,
+				SE_PROF_SINGLE_PROCESS_PRIVILEGE,
+				SE_INCREASE_QUOTA_PRIVILEGE,
+			};
 
-			switch (dialog_id)
+			_r_app_sethwnd (hwnd);
+
+			_app_initializeconfig ();
+
+			_r_sys_setprocessprivilege (NtCurrentProcess (), privileges, (ULONG)RTL_NUMBER_OF (privileges), TRUE);
+
+			_app_localize (hwnd);
+
+			if (!_wl_isfileexists ())
+				_wl_createtemplate ();
+
+			_wl_lockfile ();
+			_wl_load ();
+
+			_app_loadsettings (hwnd);
+
+			SetTimer (hwnd, TIMER_UID, TIMER_INTERVAL, NULL);
+
 			{
-				case IDD_SETTINGS_GENERAL:
-				{
-					_r_button_setcheck (hwnd, IDC_ALWAYSONTOP_CHK, _r_config_getboolean (L"AlwaysOnTop", FALSE, NULL));
-					_r_button_setcheck (hwnd, IDC_LOADONSTARTUP_CHK, _r_autorun_isenabled ());
-					_r_button_setcheck (hwnd, IDC_STARTMINIMIZED_CHK, _r_config_getboolean (L"IsStartMinimized", FALSE, NULL));
-					_r_button_setcheck (hwnd, IDC_REDUCTCONFIRMATION_CHK, _r_config_getboolean (L"IsShowReductConfirmation", TRUE, NULL));
+				R_MEMORY_INFO mem_info;
 
-					if (!_r_sys_iselevated ())
-						_r_ctrl_enable (hwnd, IDC_SKIPUACWARNING_CHK, FALSE);
+				_r_sys_getmemoryinfo (&mem_info);
 
-					_r_button_setcheck (hwnd, IDC_SKIPUACWARNING_CHK, _r_skipuac_isenabled ());
-					_r_button_setcheck (hwnd, IDC_CHECKUPDATES_CHK, _r_update_isenabled (FALSE));
-
-					_r_locale_enum (hwnd, IDC_LANGUAGE, 0);
-
-					break;
-				}
-
-				case IDD_SETTINGS_MEMORY:
-				{
-					WCHAR buffer[0x100];
-					ULONG mask;
-
-					_r_listview_setstyle (hwnd, IDC_REGIONS, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_LABELTIP | LVS_EX_DOUBLEBUFFER, FALSE);
-
-					_r_wnd_setcontext (hwnd, IDC_REGIONS, INVALID_HANDLE_VALUE);
-
-					// fix by @XakerTwo
-					_r_listview_deleteallcolumns (hwnd, IDC_REGIONS);
-					_r_listview_deleteallitems (hwnd, IDC_REGIONS);
-
-					_r_listview_addcolumn (hwnd, IDC_REGIONS, 0, NULL, 10, LVCFMT_LEFT);
-
-					_r_listview_additem (hwnd, IDC_REGIONS, 0, _r_locale_getstring (IDS_MEMREGION_WORKINGSET), I_DEFAULT, I_DEFAULT, REDUCT_WORKINGSET);
-					_r_listview_additem (hwnd, IDC_REGIONS, 1, _r_locale_getstring (IDS_MEMREGION_SYSTEMFILECACHE), I_DEFAULT, I_DEFAULT, REDUCT_SYSTEMFILECACHE);
-
-					_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s*", _r_locale_getstring (IDS_MEMREGION_MODIFIEDLIST));
-					_r_listview_additem (hwnd, IDC_REGIONS, 2, buffer, I_DEFAULT, I_DEFAULT, REDUCT_MODIFIEDLIST);
-
-					_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s*", _r_locale_getstring (IDS_MEMREGION_STANDBYLIST));
-					_r_listview_additem (hwnd, IDC_REGIONS, 3, _r_locale_getstring (IDS_MEMREGION_STANDBYLIST), I_DEFAULT, I_DEFAULT, REDUCT_STANDBYLIST);
-
-					_r_listview_additem (hwnd, IDC_REGIONS, 4, _r_locale_getstring (IDS_MEMREGION_STANDBYLISTPRIORITY0), I_DEFAULT, I_DEFAULT, REDUCT_STANDBYPRIORITY0LIST);
-					_r_listview_additem (hwnd, IDC_REGIONS, 5, _r_locale_getstring (IDS_MEMREGION_MODIFIEDFILECACHE), I_DEFAULT, I_DEFAULT, REDUCT_MODIFIEDFILECACHE);
-
-					_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s (win8.1+)", _r_locale_getstring (IDS_MEMREGION_REGISTRYCACHE));
-					_r_listview_additem (hwnd, IDC_REGIONS, 6, buffer, I_DEFAULT, I_DEFAULT, REDUCT_REGISTRYCACHE);
-
-					_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s (win10+)", _r_locale_getstring (IDS_MEMREGION_COMBINEMEMORYLISTS));
-					_r_listview_additem (hwnd, IDC_REGIONS, 7, buffer, I_DEFAULT, I_DEFAULT, REDUCT_COMBINEMEMORYLISTS);
-
-					_r_listview_setcolumn (hwnd, IDC_REGIONS, 0, NULL, -100);
-
-					mask = _r_config_getulong (L"ReductMask2", REDUCT_MASK_DEFAULT, NULL);
-
-					_r_listview_setitemcheck (hwnd, IDC_REGIONS, 0, (mask & REDUCT_WORKINGSET) == REDUCT_WORKINGSET);
-					_r_listview_setitemcheck (hwnd, IDC_REGIONS, 1, (mask & REDUCT_SYSTEMFILECACHE) == REDUCT_SYSTEMFILECACHE);
-					_r_listview_setitemcheck (hwnd, IDC_REGIONS, 2, (mask & REDUCT_MODIFIEDLIST) == REDUCT_MODIFIEDLIST);
-					_r_listview_setitemcheck (hwnd, IDC_REGIONS, 3, (mask & REDUCT_STANDBYLIST) == REDUCT_STANDBYLIST);
-					_r_listview_setitemcheck (hwnd, IDC_REGIONS, 4, (mask & REDUCT_STANDBYPRIORITY0LIST) == REDUCT_STANDBYPRIORITY0LIST);
-					_r_listview_setitemcheck (hwnd, IDC_REGIONS, 5, (mask & REDUCT_MODIFIEDFILECACHE) == REDUCT_MODIFIEDFILECACHE);
-					_r_listview_setitemcheck (hwnd, IDC_REGIONS, 6, (mask & REDUCT_REGISTRYCACHE) == REDUCT_REGISTRYCACHE);
-					_r_listview_setitemcheck (hwnd, IDC_REGIONS, 7, (mask & REDUCT_COMBINEMEMORYLISTS) == REDUCT_COMBINEMEMORYLISTS);
-
-					_r_wnd_removecontext (hwnd, IDC_REGIONS);
-
-					if (!_r_sys_iselevated ())
-					{
-						_r_ctrl_enable (hwnd, IDC_REGIONS, FALSE);
-						_r_ctrl_enable (hwnd, IDC_AUTOREDUCTENABLE_CHK, FALSE);
-						_r_ctrl_enable (hwnd, IDC_AUTOREDUCTINTERVALENABLE_CHK, FALSE);
-						_r_ctrl_enable (hwnd, IDC_HOTKEY_CLEAN_CHK, FALSE);
-						_r_ctrl_enable (hwnd, IDC_HOTKEY_CLEAN, FALSE);
-					}
-
-					_r_button_setcheck (hwnd, IDC_AUTOREDUCTENABLE_CHK, _r_config_getboolean (L"AutoreductEnable", FALSE, NULL));
-
-					_r_updown_setrange (hwnd, IDC_AUTOREDUCTVALUE, 0, 100);
-
-					_r_updown_setvalue (hwnd, IDC_AUTOREDUCTVALUE, _app_getlimitvalue ());
-
-					_r_button_setcheck (hwnd, IDC_AUTOREDUCTINTERVALENABLE_CHK, _r_config_getboolean (L"AutoreductIntervalEnable", FALSE, NULL));
-
-					_r_updown_setrange (hwnd, IDC_AUTOREDUCTINTERVALVALUE, 1, 1440);
-
-					_r_updown_setvalue (hwnd, IDC_AUTOREDUCTINTERVALVALUE, _app_getintervalvalue ());
-
-					_r_button_setcheck (hwnd, IDC_HOTKEY_CLEAN_CHK, _r_config_getboolean (L"HotkeyCleanEnable", FALSE, NULL));
-
-					if (!_r_button_ischecked (hwnd, IDC_HOTKEY_CLEAN_CHK))
-						_r_ctrl_enable (hwnd, IDC_HOTKEY_CLEAN, FALSE);
-
-					_r_hotkey_set (hwnd, IDC_HOTKEY_CLEAN, _r_config_getlong (L"HotkeyClean", MAKEWORD (VK_F1, HOTKEYF_CONTROL), NULL));
-
-					_r_wnd_sendcommand (hwnd, IDC_AUTOREDUCTENABLE_CHK, 0);
-					_r_wnd_sendcommand (hwnd, IDC_AUTOREDUCTINTERVALENABLE_CHK, 0);
-					_r_wnd_sendcommand (hwnd, IDC_HOTKEY_CLEAN_CHK, 0);
-
-					break;
-				}
-
-				case IDD_SETTINGS_APPEARANCE:
-				{
-					LOGFONT logfont;
-					LONG dpi_value;
-
-					_r_button_setcheck (hwnd, IDC_TRAYUSETRANSPARENCY_CHK, _r_config_getboolean (L"TrayUseTransparency", FALSE, NULL));
-					_r_button_setcheck (hwnd, IDC_TRAYSHOWBORDER_CHK, _r_config_getboolean (L"TrayShowBorder", FALSE, NULL));
-					_r_button_setcheck (hwnd, IDC_TRAYROUNDCORNERS_CHK, _r_config_getboolean (L"TrayRoundCorners", FALSE, NULL));
-					_r_button_setcheck (hwnd, IDC_TRAYCHANGEBG_CHK, _r_config_getboolean (L"TrayChangeBg", TRUE, NULL));
-					_r_button_setcheck (hwnd, IDC_TRAYUSEANTIALIASING_CHK, _r_config_getboolean (L"TrayUseAntialiasing", FALSE, NULL));
-
-					dpi_value = _r_dc_gettaskbardpi ();
-
-					_app_fontinit (&logfont, dpi_value);
-					_app_setfontcontrol (hwnd, IDC_FONT, &logfont, dpi_value);
-
-					_r_listview_setstyle (hwnd, IDC_COLORS, LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_LABELTIP, FALSE);
-
-					// fix by @XakerTwo
-					_r_listview_deleteallcolumns (hwnd, IDC_COLORS);
-					_r_listview_deleteallitems (hwnd, IDC_COLORS);
-
-					_r_listview_addcolumn (hwnd, IDC_COLORS, 0, NULL, -100, LVCFMT_LEFT);
-
-					_r_listview_additem (hwnd, IDC_COLORS, 0, _r_locale_getstring (IDS_COLOR_TEXT_HINT), I_DEFAULT, I_DEFAULT, _r_config_getulong (L"TrayColorText", TRAY_COLOR_TEXT, NULL));
-					_r_listview_additem (hwnd, IDC_COLORS, 1, _r_locale_getstring (IDS_COLOR_BACKGROUND_HINT), I_DEFAULT, I_DEFAULT, _r_config_getulong (L"TrayColorBg", TRAY_COLOR_BG, NULL));
-					_r_listview_additem (hwnd, IDC_COLORS, 2, _r_locale_getstring (IDS_COLOR_WARNING_HINT), I_DEFAULT, I_DEFAULT, _r_config_getulong (L"TrayColorWarning", TRAY_COLOR_WARNING, NULL));
-					_r_listview_additem (hwnd, IDC_COLORS, 3, _r_locale_getstring (IDS_COLOR_DANGER_HINT), I_DEFAULT, I_DEFAULT, _r_config_getulong (L"TrayColorDanger", TRAY_COLOR_DANGER, NULL));
-
-					break;
-				}
-
-				case IDD_SETTINGS_TRAY:
-				{
-					_r_updown_setrange (hwnd, IDC_TRAYLEVELWARNING, 0, 100);
-					_r_updown_setvalue (hwnd, IDC_TRAYLEVELWARNING, _app_getwarningvalue ());
-
-					_r_updown_setrange (hwnd, IDC_TRAYLEVELDANGER, 0, 100);
-					_r_updown_setvalue (hwnd, IDC_TRAYLEVELDANGER, _app_getdangervalue ());
-
-					_r_combobox_setcurrentitem (hwnd, IDC_TRAYACTIONSC, _r_config_getlong (L"TrayActionDc", 0, NULL));
-					_r_combobox_setcurrentitem (hwnd, IDC_TRAYACTIONMC, _r_config_getlong (L"TrayActionMc", 1, NULL));
-
-					_r_button_setcheck (hwnd, IDC_SHOW_CLEAN_RESULT_CHK, _r_config_getboolean (L"BalloonCleanResults", TRUE, NULL));
-					_r_button_setcheck (hwnd, IDC_NOTIFICATIONSOUND_CHK, _r_config_getboolean (L"IsNotificationsSound", TRUE, NULL));
-
-					break;
-				}
-
-				case IDD_SETTINGS_ADVANCED:
-				{
-					_r_button_setcheck (hwnd, IDC_ALLOWSTANDBYLISTCLEANUP_CHK, _r_config_getboolean (L"IsAllowStandbyListCleanup", FALSE, NULL));
-					_r_button_setcheck (hwnd, IDC_LOGRESULTS_CHK, _r_config_getboolean (L"LogCleanResults", FALSE, NULL));
-
-					break;
-				}
+				tray_percent = (ULONG)mem_info.physical_memory.percent;
+				tray_icon = _app_createicon (tray_percent);
 			}
+
+			_r_tray_create (hwnd, &GUID_TRAYICON, RM_TRAYICON, tray_icon, L_TRAY_TIP, FALSE);
+
+			_app_updateui (hwnd);
 
 			break;
 		}
 
-		case RM_LOCALIZE:
+		case RM_TASKBARCREATED:
 		{
-			INT dialog_id = (INT)wparam;
+			if (tray_icon)
+				DestroyIcon (tray_icon);
 
-			// localize titles
-			_r_ctrl_setstringformat (hwnd, IDC_TITLE_1, L"%s:", _r_locale_getstring (IDS_TITLE_1));
-			_r_ctrl_setstringformat (hwnd, IDC_TITLE_2, L"%s: (Language)", _r_locale_getstring (IDS_TITLE_2));
-			_r_ctrl_setstringformat (hwnd, IDC_TITLE_3, L"%s:", _r_locale_getstring (IDS_TITLE_3));
-			_r_ctrl_setstringformat (hwnd, IDC_TITLE_4, L"%s:", _r_locale_getstring (IDS_TITLE_4));
-			_r_ctrl_setstringformat (hwnd, IDC_TITLE_5, L"%s:", _r_locale_getstring (IDS_TITLE_5));
-			_r_ctrl_setstringformat (hwnd, IDC_TITLE_6, L"%s:", _r_locale_getstring (IDS_TITLE_6));
-			_r_ctrl_setstringformat (hwnd, IDC_TITLE_7, L"%s:", _r_locale_getstring (IDS_TITLE_7));
-			_r_ctrl_setstringformat (hwnd, IDC_TITLE_8, L"%s:", _r_locale_getstring (IDS_TITLE_8));
-			_r_ctrl_setstringformat (hwnd, IDC_TITLE_9, L"%s:", _r_locale_getstring (IDS_TITLE_9));
+			tray_icon = _app_createicon (tray_percent == ULONG_MAX ? 0 : tray_percent);
 
-			switch (dialog_id)
-			{
-				case IDD_SETTINGS_GENERAL:
-				{
-					_r_ctrl_setstring (hwnd, IDC_ALWAYSONTOP_CHK, _r_locale_getstring (IDS_ALWAYSONTOP_CHK));
-					_r_ctrl_setstring (hwnd, IDC_LOADONSTARTUP_CHK, _r_locale_getstring (IDS_LOADONSTARTUP_CHK));
-					_r_ctrl_setstring (hwnd, IDC_STARTMINIMIZED_CHK, _r_locale_getstring (IDS_STARTMINIMIZED_CHK));
-					_r_ctrl_setstring (hwnd, IDC_REDUCTCONFIRMATION_CHK, _r_locale_getstring (IDS_REDUCTCONFIRMATION_CHK));
-					_r_ctrl_setstring (hwnd, IDC_SKIPUACWARNING_CHK, _r_locale_getstring (IDS_SKIPUACWARNING_CHK));
-					_r_ctrl_setstring (hwnd, IDC_CHECKUPDATES_CHK, _r_locale_getstring (IDS_CHECKUPDATES_CHK));
-					_r_ctrl_setstring (hwnd, IDC_LANGUAGE_HINT, _r_locale_getstring (IDS_LANGUAGE_HINT));
-
-					break;
-				}
-
-				case IDD_SETTINGS_MEMORY:
-				{
-					_r_ctrl_setstring (hwnd, IDC_AUTOREDUCTENABLE_CHK, _r_locale_getstring (IDS_AUTOREDUCTENABLE_CHK));
-					_r_ctrl_setstring (hwnd, IDC_AUTOREDUCTINTERVALENABLE_CHK, _r_locale_getstring (IDS_AUTOREDUCTINTERVALENABLE_CHK));
-					_r_ctrl_setstring (hwnd, IDC_HOTKEY_CLEAN_CHK, _r_locale_getstring (IDS_HOTKEY_CLEAN_CHK));
-
-					break;
-				}
-
-				case IDD_SETTINGS_APPEARANCE:
-				{
-					_r_ctrl_setstring (hwnd, IDC_TRAYUSETRANSPARENCY_CHK, _r_locale_getstring (IDS_TRAYUSETRANSPARENCY_CHK));
-					_r_ctrl_setstring (hwnd, IDC_TRAYSHOWBORDER_CHK, _r_locale_getstring (IDS_TRAYSHOWBORDER_CHK));
-					_r_ctrl_setstring (hwnd, IDC_TRAYROUNDCORNERS_CHK, _r_locale_getstring (IDS_TRAYROUNDCORNERS_CHK));
-					_r_ctrl_setstring (hwnd, IDC_TRAYCHANGEBG_CHK, _r_locale_getstring (IDS_TRAYCHANGEBG_CHK));
-					_r_ctrl_setstring (hwnd, IDC_TRAYUSEANTIALIASING_CHK, _r_locale_getstring (IDS_TRAYUSEANTIALIASING_CHK));
-					_r_ctrl_setstring (hwnd, IDC_FONT_HINT, _r_locale_getstring (IDS_FONT_HINT));
-
-					_r_listview_setitem (hwnd, IDC_COLORS, 0, 0, _r_locale_getstring (IDS_COLOR_TEXT_HINT), I_DEFAULT, I_DEFAULT, I_DEFAULT);
-					_r_listview_setitem (hwnd, IDC_COLORS, 1, 0, _r_locale_getstring (IDS_COLOR_BACKGROUND_HINT), I_DEFAULT, I_DEFAULT, I_DEFAULT);
-					_r_listview_setitem (hwnd, IDC_COLORS, 2, 0, _r_locale_getstring (IDS_COLOR_WARNING_HINT), I_DEFAULT, I_DEFAULT, I_DEFAULT);
-					_r_listview_setitem (hwnd, IDC_COLORS, 3, 0, _r_locale_getstring (IDS_COLOR_DANGER_HINT), I_DEFAULT, I_DEFAULT, I_DEFAULT);
-
-					break;
-				}
-
-				case IDD_SETTINGS_TRAY:
-				{
-					LPCWSTR string;
-
-					_r_ctrl_setstring (hwnd, IDC_TRAYLEVELWARNING_HINT, _r_locale_getstring (IDS_TRAYLEVELWARNING_HINT));
-					_r_ctrl_setstring (hwnd, IDC_TRAYLEVELDANGER_HINT, _r_locale_getstring (IDS_TRAYLEVELDANGER_HINT));
-
-					_r_ctrl_setstring (hwnd, IDC_TRAYACTIONSC_HINT, _r_locale_getstring (IDS_TRAYACTIONSC_HINT));
-					_r_ctrl_setstring (hwnd, IDC_TRAYACTIONMC_HINT, _r_locale_getstring (IDS_TRAYACTIONMC_HINT));
-
-					_r_combobox_clear (hwnd, IDC_TRAYACTIONSC);
-					_r_combobox_clear (hwnd, IDC_TRAYACTIONMC);
-
-					for (INT i = 0; i < 3; i++)
-					{
-						string = _r_locale_getstring (IDS_TRAY_ACTION_1 + i);
-
-						_r_combobox_insertitem (hwnd, IDC_TRAYACTIONSC, i, string, i);
-						_r_combobox_insertitem (hwnd, IDC_TRAYACTIONMC, i, string, i);
-					}
-
-					_r_combobox_setcurrentitembylparam (hwnd, IDC_TRAYACTIONSC, _r_config_getlong (L"TrayActionDc", 0, NULL));
-					_r_combobox_setcurrentitembylparam (hwnd, IDC_TRAYACTIONMC, _r_config_getlong (L"TrayActionMc", 1, NULL));
-
-					_r_ctrl_setstring (hwnd, IDC_SHOW_CLEAN_RESULT_CHK, _r_locale_getstring (IDS_SHOW_CLEAN_RESULT_CHK));
-					_r_ctrl_setstring (hwnd, IDC_NOTIFICATIONSOUND_CHK, _r_locale_getstring (IDS_NOTIFICATIONSOUND_CHK));
-
-					break;
-				}
-
-				case IDD_SETTINGS_ADVANCED:
-				{
-					_r_ctrl_setstring (hwnd, IDC_ALLOWSTANDBYLISTCLEANUP_CHK, _r_locale_getstring (IDS_ALLOWSTANDBYLISTCLEANUP_CHK));
-					_r_ctrl_setstring (hwnd, IDC_LOGRESULTS_CHK, _r_locale_getstring (IDS_LOGRESULTS_CHK));
-
-					break;
-				}
-			}
+			_r_tray_create (hwnd, &GUID_TRAYICON, RM_TRAYICON, tray_icon, L_TRAY_TIP, FALSE);
 
 			break;
 		}
 
-		case WM_NOTIFY:
+		case WM_TIMER:
 		{
-			LPNMHDR nmlp = (LPNMHDR)lparam;
+			R_MEMORY_INFO mem_info;
+			LONG64 now;
+			ULONG percent, limit, rearm_interval;
 
-			switch (nmlp->code)
+			if (wparam != TIMER_UID)
+				break;
+
+			_app_updateui (hwnd);
+
+			if (!SendMessageW (GetDlgItem (hwnd, IDC_AUTO_CHK), BM_GETCHECK, 0, 0))
+				break;
+
+			_r_sys_getmemoryinfo (&mem_info);
+
+			percent = (ULONG)mem_info.physical_memory.percent;
+			limit = _app_getautocleanpercent ();
+			now = _r_unixtime_now ();
+
+			rearm_interval = (limit < AUTOCLEAN_RECOMMENDED_PERCENT) ? AUTOCLEAN_REARM_INTERVAL_LOW : AUTOCLEAN_REARM_INTERVAL;
+
+			// re-arm only after usage drops below threshold - hysteresis
+			if (percent <= (limit - AUTOCLEAN_HYSTERESIS))
 			{
-				case NM_CUSTOMDRAW:
-				{
-					LPNMLVCUSTOMDRAW lpnmlv = (LPNMLVCUSTOMDRAW)lparam;
-					COLORREF clr;
-
-					switch (lpnmlv->nmcd.dwDrawStage)
-					{
-						case CDDS_PREPAINT:
-						{
-							SetWindowLongPtrW (hwnd, DWLP_MSGRESULT, CDRF_NOTIFYITEMDRAW);
-
-							return CDRF_NOTIFYITEMDRAW;
-						}
-
-						case CDDS_ITEMPREPAINT:
-						{
-							LONG_PTR value = CDRF_DODEFAULT;
-
-							if (lpnmlv->nmcd.hdr.idFrom == IDC_REGIONS)
-							{
-								if (_r_sys_isosversionlower (WINDOWS_8_1) && (lpnmlv->nmcd.lItemlParam & REDUCT_REGISTRYCACHE) == REDUCT_REGISTRYCACHE)
-								{
-									clr = _r_theme_isenabled () ? WND_GRAYTEXT_CLR : GetSysColor (COLOR_GRAYTEXT);
-
-									lpnmlv->clrText = _r_dc_getcolorbrightness (clr);
-									lpnmlv->clrTextBk = clr;
-
-									value = CDRF_NEWFONT;
-								}
-
-								if (_r_sys_isosversionlower (WINDOWS_10) && (lpnmlv->nmcd.lItemlParam & REDUCT_COMBINEMEMORYLISTS) == REDUCT_COMBINEMEMORYLISTS)
-								{
-									clr = _r_theme_isenabled () ? WND_GRAYTEXT_CLR : GetSysColor (COLOR_GRAYTEXT);
-
-									lpnmlv->clrText = _r_dc_getcolorbrightness (clr);
-									lpnmlv->clrTextBk = clr;
-
-									value = CDRF_NEWFONT;
-								}
-							}
-							else if (lpnmlv->nmcd.hdr.idFrom == IDC_COLORS)
-							{
-								clr = (COLORREF)lpnmlv->nmcd.lItemlParam;
-
-								lpnmlv->clrText = _r_dc_getcolorbrightness (clr);
-								lpnmlv->clrTextBk = clr;
-
-								_r_dc_fillrect (lpnmlv->nmcd.hdc, &lpnmlv->nmcd.rc, clr);
-
-								value = CDRF_NEWFONT;
-							}
-
-							SetWindowLongPtrW (hwnd, DWLP_MSGRESULT, value);
-
-							return value;
-						}
-					}
-
-					break;
-				}
-
-				case NM_DBLCLK:
-				{
-					LPNMITEMACTIVATE lpnmlv = (LPNMITEMACTIVATE)lparam;
-					CHOOSECOLOR cc = {0};
-					COLORREF clr, cust[0x10] = {TRAY_COLOR_DANGER, TRAY_COLOR_WARNING, TRAY_COLOR_BG, TRAY_COLOR_TEXT};
-
-					if (lpnmlv->hdr.idFrom != IDC_COLORS || lpnmlv->iItem == INT_ERROR)
-						break;
-
-					clr = (COLORREF)_r_listview_getitemlparam (hwnd, (INT)(INT_PTR)lpnmlv->hdr.idFrom, lpnmlv->iItem);
-
-					cc.lStructSize = sizeof (CHOOSECOLOR);
-					cc.Flags = CC_RGBINIT | CC_FULLOPEN;
-					cc.hwndOwner = hwnd;
-					cc.lpCustColors = cust;
-					cc.rgbResult = clr;
-
-					if (ChooseColorW (&cc))
-					{
-						if (lpnmlv->iItem == 0)
-						{
-							_r_config_setulong (L"TrayColorText", cc.rgbResult, NULL);
-						}
-						else if (lpnmlv->iItem == 1)
-						{
-							_r_config_setulong (L"TrayColorBg", cc.rgbResult, NULL);
-						}
-						else if (lpnmlv->iItem == 2)
-						{
-							_r_config_setulong (L"TrayColorWarning", cc.rgbResult, NULL);
-						}
-						else if (lpnmlv->iItem == 3)
-						{
-							_r_config_setulong (L"TrayColorDanger", cc.rgbResult, NULL);
-						}
-
-						_r_listview_setitem (hwnd, IDC_COLORS, lpnmlv->iItem, lpnmlv->iSubItem, NULL, I_DEFAULT, I_DEFAULT, cc.rgbResult);
-
-						_r_listview_redraw (hwnd, IDC_COLORS);
-
-						_app_iconinit (_r_dc_gettaskbardpi ());
-						_app_iconredraw (_r_app_gethwnd ());
-					}
-
-					break;
-				}
-
-				case LVN_ITEMCHANGED:
-				{
-					LPNMLISTVIEW lpnmlv = (LPNMLISTVIEW)lparam;
-					ULONG mask, value;
-
-					if (lpnmlv->hdr.idFrom != IDC_REGIONS)
-						break;
-
-					if (_r_wnd_getcontext (hwnd, (INT)(INT_PTR)lpnmlv->hdr.idFrom))
-						break;
-
-					if ((lpnmlv->uChanged & LVIF_STATE) == 0)
-						break;
-
-					if ((lpnmlv->uNewState & LVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK (1) || ((lpnmlv->uNewState & LVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK (2)))
-					{
-						value = (ULONG)lpnmlv->lParam;
-
-						mask = _r_config_getulong (L"ReductMask2", REDUCT_MASK_DEFAULT, NULL);
-
-						if ((lpnmlv->uNewState & LVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK (2))
-						{
-							if ((value & REDUCT_MASK_FREEZES) != 0)
-							{
-								if (!_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_QUESTION_WARNING), NULL, L"IsShowWarningConfirmation", FALSE))
-								{
-									_r_listview_setitemcheck (hwnd, (INT)(INT_PTR)lpnmlv->hdr.idFrom, lpnmlv->iItem, FALSE);
-
-									return FALSE;
-								}
-							}
-						}
-
-						if (_r_sys_isosversionlower (WINDOWS_8_1) && (value & REDUCT_REGISTRYCACHE) == REDUCT_REGISTRYCACHE)
-						{
-							_r_listview_setitemcheck (hwnd, (INT)(INT_PTR)lpnmlv->hdr.idFrom, lpnmlv->iItem, (mask & REDUCT_REGISTRYCACHE) == REDUCT_REGISTRYCACHE);
-
-							return FALSE;
-						}
-
-						if (_r_sys_isosversionlower (WINDOWS_10) && (value & REDUCT_COMBINEMEMORYLISTS) == REDUCT_COMBINEMEMORYLISTS)
-						{
-							_r_listview_setitemcheck (hwnd, (INT)(INT_PTR)lpnmlv->hdr.idFrom, lpnmlv->iItem, (mask & REDUCT_COMBINEMEMORYLISTS) == REDUCT_COMBINEMEMORYLISTS);
-
-							return FALSE;
-						}
-
-						if ((lpnmlv->uNewState & LVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK (2))
-						{
-							mask |= value;
-						}
-						else
-						{
-							mask &= ~value;
-						}
-
-						_r_config_setulong (L"ReductMask2", mask, NULL);
-					}
-
-					break;
-				}
+				is_autoclean_armed = TRUE;
+			}
+			else if (!is_autoclean_armed && (now - (LONG64)last_clean_time) >= (LONG64)rearm_interval)
+			{
+				// safety valve: bounded rate when usage never drops
+				is_autoclean_armed = TRUE;
 			}
 
-			break;
-		}
+			if (!is_autoclean_armed)
+				break;
 
-		case WM_VSCROLL:
-		case WM_HSCROLL:
-		{
-			LONG value;
-			INT ctrl_id;
-			BOOLEAN is_stylechanged = FALSE;
+			if (percent < limit)
+				break;
 
-			ctrl_id = GetDlgCtrlID ((HWND)lparam);
+			if ((now - (LONG64)last_clean_time) < AUTOCLEAN_COOLDOWN)
+				break;
 
-			if (ctrl_id == IDC_AUTOREDUCTVALUE)
-			{
-				value = _r_updown_getvalue (hwnd, ctrl_id);
-
-				_r_config_setlong (L"AutoreductValue", value, NULL);
-			}
-			else if (ctrl_id == IDC_AUTOREDUCTINTERVALVALUE)
-			{
-				value = _r_updown_getvalue (hwnd, ctrl_id);
-
-				_r_config_setlong (L"AutoreductIntervalValue", value, NULL);
-			}
-			else if (ctrl_id == IDC_TRAYLEVELWARNING)
-			{
-				value = _r_updown_getvalue (hwnd, ctrl_id);
-
-				_r_config_setlong (L"TrayLevelWarning", value, NULL);
-
-				is_stylechanged = TRUE;
-			}
-			else if (ctrl_id == IDC_TRAYLEVELDANGER)
-			{
-				value = _r_updown_getvalue (hwnd, ctrl_id);
-
-				_r_config_setlong (L"TrayLevelDanger", value, NULL);
-
-				is_stylechanged = TRUE;
-			}
-
-			if (is_stylechanged)
-			{
-				_app_iconredraw (_r_app_gethwnd ());
-
-				_r_listview_redraw (_r_app_gethwnd (), IDC_LISTVIEW);
-			}
+			_app_clean (hwnd, TRUE);
 
 			break;
 		}
@@ -1362,657 +895,105 @@ INT_PTR CALLBACK SettingsProc (
 
 			switch (ctrl_id)
 			{
-				case IDC_AUTOREDUCTVALUE_CTRL:
+				case IDC_CLEAN:
 				{
-					LONG value;
+					_app_clean (hwnd, FALSE);
 
-					if (notify_code == EN_CHANGE)
+					break;
+				}
+
+				case IDC_AUTO_CHK:
+				{
+					BOOLEAN is_checked = !!SendMessageW (GetDlgItem (hwnd, IDC_AUTO_CHK), BM_GETCHECK, 0, 0);
+
+					_app_setconfig (L"AutoClean", is_checked ? 1 : 0);
+
+					EnableWindow (GetDlgItem (hwnd, IDC_AUTO_VALUE_CTRL), is_checked ? TRUE : FALSE);
+
+					break;
+				}
+
+				case IDC_AUTO_VALUE_CTRL:
+				{
+					WCHAR buffer[0x20];
+					ULONG percent;
+
+					if (notify_code == EN_KILLFOCUS)
 					{
-						value = _r_updown_getvalue (hwnd, IDC_AUTOREDUCTVALUE);
+						// normalize the field to the effective (clamped) value
+						_r_str_fromulong (buffer, RTL_NUMBER_OF (buffer), _app_getautocleanpercent ());
 
-						_r_config_setlong (L"AutoreductValue", value, NULL);
+						SetWindowTextW (GetDlgItem (hwnd, IDC_AUTO_VALUE_CTRL), buffer);
+
+						break;
 					}
 
-					break;
-				}
-
-				case IDC_AUTOREDUCTINTERVALVALUE_CTRL:
-				{
-					LONG value;
-
-					if (notify_code == EN_CHANGE)
-					{
-						value = _r_updown_getvalue (hwnd, IDC_AUTOREDUCTINTERVALVALUE);
-
-						_r_config_setlong (L"AutoreductIntervalValue", value, NULL);
-					}
-
-					break;
-				}
-
-				case IDC_TRAYLEVELWARNING_CTRL:
-				case IDC_TRAYLEVELDANGER_CTRL:
-				{
-					if (notify_code == EN_CHANGE)
-					{
-						if (ctrl_id == IDC_TRAYLEVELWARNING_CTRL)
-						{
-							_r_config_setlong (L"TrayLevelWarning", _r_updown_getvalue (hwnd, IDC_TRAYLEVELWARNING), NULL);
-						}
-						else if (ctrl_id == IDC_TRAYLEVELDANGER_CTRL)
-						{
-							_r_config_setlong (L"TrayLevelDanger", _r_updown_getvalue (hwnd, IDC_TRAYLEVELDANGER), NULL);
-						}
-
-						_app_iconredraw (_r_app_gethwnd ());
-
-						_r_listview_redraw (_r_app_gethwnd (), IDC_LISTVIEW);
-					}
-
-					break;
-				}
-
-				case IDC_ALWAYSONTOP_CHK:
-				{
-					BOOLEAN is_enable = _r_button_ischecked (hwnd, ctrl_id);
-
-					_r_config_setboolean (L"AlwaysOnTop", is_enable, NULL);
-
-					_r_menu_checkitem (GetMenu (_r_app_gethwnd ()), IDM_ALWAYSONTOP_CHK, 0, MF_BYCOMMAND, is_enable);
-
-					break;
-				}
-
-				case IDC_LOADONSTARTUP_CHK:
-				{
-					BOOLEAN is_enable = _r_button_ischecked (hwnd, ctrl_id);
-
-					_r_autorun_enable (hwnd, is_enable);
-
-					is_enable = _r_autorun_isenabled ();
-
-					_r_menu_checkitem (GetMenu (_r_app_gethwnd ()), IDM_LOADONSTARTUP_CHK, 0, MF_BYCOMMAND, is_enable);
-
-					_r_button_setcheck (hwnd, ctrl_id, is_enable);
-
-					break;
-				}
-
-				case IDC_STARTMINIMIZED_CHK:
-				{
-					BOOLEAN is_enable = _r_button_ischecked (hwnd, ctrl_id);
-
-					_r_config_setboolean (L"IsStartMinimized", is_enable, NULL);
-
-					_r_menu_checkitem (GetMenu (_r_app_gethwnd ()), IDM_STARTMINIMIZED_CHK, 0, MF_BYCOMMAND, is_enable);
-
-					break;
-				}
-
-				case IDC_REDUCTCONFIRMATION_CHK:
-				{
-					BOOLEAN is_enable = _r_button_ischecked (hwnd, ctrl_id);
-
-					_r_config_setboolean (L"IsShowReductConfirmation", is_enable, NULL);
-
-					_r_menu_checkitem (GetMenu (_r_app_gethwnd ()), IDM_REDUCTCONFIRMATION_CHK, 0, MF_BYCOMMAND, is_enable);
-
-					break;
-				}
-
-				case IDC_SKIPUACWARNING_CHK:
-				{
-					BOOLEAN is_enable = _r_button_ischecked (hwnd, ctrl_id);
-
-					_r_skipuac_enable (hwnd, is_enable);
-
-					is_enable = _r_skipuac_isenabled ();
-
-					_r_menu_checkitem (GetMenu (_r_app_gethwnd ()), IDM_SKIPUACWARNING_CHK, 0, MF_BYCOMMAND, is_enable);
-
-					_r_button_setcheck (hwnd, ctrl_id, is_enable);
-
-					break;
-				}
-
-				case IDC_CHECKUPDATES_CHK:
-				{
-					BOOLEAN is_enable = _r_button_ischecked (hwnd, ctrl_id);
-
-					_r_update_enable (is_enable);
-
-					is_enable = _r_update_isenabled (FALSE);
-
-					_r_menu_checkitem (GetMenu (_r_app_gethwnd ()), IDM_CHECKUPDATES_CHK, 0, MF_BYCOMMAND, is_enable);
-
-					break;
-				}
-
-				case IDC_LANGUAGE:
-				{
-					if (notify_code == CBN_SELCHANGE)
-						_r_locale_apply (hwnd, ctrl_id, 0);
-
-					break;
-				}
-
-				case IDC_AUTOREDUCTENABLE_CHK:
-				{
-					HWND hbuddy;
-					BOOLEAN is_enabled = _r_ctrl_isenabled (hwnd, ctrl_id);
-
-					hbuddy = _r_updown_getbuddy (hwnd, IDC_AUTOREDUCTVALUE);
-
-					if (hbuddy)
-						_r_ctrl_enable (hbuddy, 0, is_enabled);
-
-					if (is_enabled)
-						_r_config_setboolean (L"AutoreductEnable", _r_button_ischecked (hwnd, ctrl_id), NULL);
-
-					break;
-				}
-
-				case IDC_AUTOREDUCTINTERVALENABLE_CHK:
-				{
-					HWND hbuddy;
-					BOOLEAN is_enabled = _r_ctrl_isenabled (hwnd, ctrl_id);
-
-					hbuddy = _r_updown_getbuddy (hwnd, IDC_AUTOREDUCTINTERVALVALUE);
-
-					if (hbuddy)
-						_r_ctrl_enable (hbuddy, 0, is_enabled);
-
-					if (is_enabled)
-						_r_config_setboolean (L"AutoreductIntervalEnable", _r_button_ischecked (hwnd, ctrl_id), NULL);
-
-					break;
-				}
-
-				case IDC_HOTKEY_CLEAN_CHK:
-				{
-					BOOLEAN is_checked = _r_button_ischecked (hwnd, ctrl_id);
-
-					_r_ctrl_enable (hwnd, IDC_HOTKEY_CLEAN, is_checked);
-
-					_r_config_setboolean (L"HotkeyCleanEnable", is_checked, NULL);
-
-					_app_hotkeyinit (_r_app_gethwnd ());
-
-					break;
-				}
-
-				case IDC_HOTKEY_CLEAN:
-				{
-					if (!_r_button_ischecked (hwnd, IDC_HOTKEY_CLEAN_CHK))
+					if (notify_code != EN_CHANGE)
 						break;
 
-					if (notify_code == EN_CHANGE)
-					{
-						_r_config_setlong (L"HotkeyClean", _r_hotkey_get (hwnd, ctrl_id), NULL);
+					GetWindowTextW (GetDlgItem (hwnd, IDC_AUTO_VALUE_CTRL), buffer, RTL_NUMBER_OF (buffer));
 
-						_app_hotkeyinit (_r_app_gethwnd ());
+					percent = _app_parseulong (buffer);
+
+					if (percent >= AUTOCLEAN_MIN_PERCENT && percent <= AUTOCLEAN_MAX_PERCENT)
+					{
+						_app_setconfig (L"AutoCleanPercent", percent);
+
+						// a new threshold re-arms the automatic cleanup
+						is_autoclean_armed = TRUE;
+
+						_app_updateautowarn (hwnd);
 					}
 
 					break;
 				}
 
-				case IDC_TRAYUSETRANSPARENCY_CHK:
-				case IDC_TRAYSHOWBORDER_CHK:
-				case IDC_TRAYROUNDCORNERS_CHK:
-				case IDC_TRAYCHANGEBG_CHK:
-				case IDC_TRAYUSEANTIALIASING_CHK:
+				case IDC_SFC_CHK:
 				{
-					BOOLEAN is_enabled = _r_button_ischecked (hwnd, ctrl_id);
+					BOOLEAN is_checked = !!SendMessageW (GetDlgItem (hwnd, IDC_SFC_CHK), BM_GETCHECK, 0, 0);
 
-					switch (ctrl_id)
-					{
-						case IDC_TRAYUSETRANSPARENCY_CHK:
-						{
-							_r_config_setboolean (L"TrayUseTransparency", is_enabled, NULL);
-							break;
-						}
-
-						case IDC_TRAYSHOWBORDER_CHK:
-						{
-							_r_config_setboolean (L"TrayShowBorder", is_enabled, NULL);
-							break;
-						}
-
-						case IDC_TRAYROUNDCORNERS_CHK:
-						{
-							_r_config_setboolean (L"TrayRoundCorners", is_enabled, NULL);
-							break;
-						}
-
-						case IDC_TRAYCHANGEBG_CHK:
-						{
-							_r_config_setboolean (L"TrayChangeBg", is_enabled, NULL);
-							break;
-						}
-
-						case IDC_TRAYUSEANTIALIASING_CHK:
-						{
-							_r_config_setboolean (L"TrayUseAntialiasing", is_enabled, NULL);
-							break;
-						}
-					}
-
-					_app_iconinit (_r_dc_gettaskbardpi ());
-					_app_iconredraw (_r_app_gethwnd ());
+					_app_setconfig (L"CleanSystemCache", is_checked ? 1 : 0);
 
 					break;
 				}
 
-				case IDC_TRAYACTIONSC:
+				case IDC_WL_EDIT:
 				{
-					if (notify_code == CBN_SELCHANGE)
-						_r_config_setlong (L"TrayActionDc", _r_combobox_getcurrentitem (hwnd, ctrl_id), NULL);
+					LPCWSTR path;
+
+					if (!_wl_isfileexists ())
+						_wl_createtemplate ();
+
+					path = _wl_getfilepath ();
+
+					if (!path || ShellExecuteW (hwnd, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL) <= (HINSTANCE)32)
+						_r_show_message (hwnd, MB_OK | MB_ICONEXCLAMATION, L_APP_TITLE, L_EDIT_FAILED);
 
 					break;
 				}
 
-				case IDC_TRAYACTIONMC:
+				case IDM_TRAY_SHOW:
 				{
-					if (notify_code == CBN_SELCHANGE)
-						_r_config_setlong (L"TrayActionMc", _r_combobox_getcurrentitem (hwnd, ctrl_id), NULL);
+					ShowWindow (hwnd, SW_SHOW);
+					SetForegroundWindow (hwnd);
 
 					break;
 				}
 
-				case IDC_SHOW_CLEAN_RESULT_CHK:
+				case IDM_TRAY_CLEAN:
 				{
-					_r_config_setboolean (L"BalloonCleanResults", _r_button_ischecked (hwnd, ctrl_id), NULL);
-					break;
-				}
-
-				case IDC_NOTIFICATIONSOUND_CHK:
-				{
-					_r_config_setboolean (L"IsNotificationsSound", _r_button_ischecked (hwnd, ctrl_id), NULL);
-					break;
-				}
-
-				case IDC_FONT:
-				{
-					CHOOSEFONT cf = {0};
-					LOGFONT logfont;
-					LONG dpi_value;
-
-					cf.lStructSize = sizeof (CHOOSEFONT);
-					cf.hwndOwner = hwnd;
-					cf.Flags = CF_INITTOLOGFONTSTRUCT | CF_FORCEFONTEXIST | CF_SCREENFONTS;
-
-					dpi_value = _r_dc_gettaskbardpi ();
-
-					_app_fontinit (&logfont, dpi_value);
-
-					cf.lpLogFont = &logfont;
-
-					if (ChooseFontW (&cf))
-					{
-						_r_config_setfont (L"TrayFont", &logfont, dpi_value, NULL);
-
-						_app_setfontcontrol (hwnd, IDC_FONT, &logfont, dpi_value);
-
-						_app_iconinit (dpi_value);
-						_app_iconredraw (_r_app_gethwnd ());
-					}
+					_app_clean (hwnd, FALSE);
 
 					break;
 				}
 
-				case IDC_ALLOWSTANDBYLISTCLEANUP_CHK:
+				case IDM_TRAY_EXIT:
 				{
-					_r_config_setboolean (L"IsAllowStandbyListCleanup", _r_button_ischecked (hwnd, ctrl_id), NULL);
-					break;
-				}
+					is_exiting = TRUE;
 
-				case IDC_LOGRESULTS_CHK:
-				{
-					_r_config_setboolean (L"LogCleanResults", _r_button_ischecked (hwnd, ctrl_id), NULL);
-					break;
-				}
-			}
-
-			break;
-		}
-	}
-
-	return FALSE;
-}
-
-VOID _app_resizecolumns (
-	_In_ HWND hwnd
-)
-{
-	_r_listview_setcolumn (hwnd, IDC_LISTVIEW, 0, NULL, -50);
-	_r_listview_setcolumn (hwnd, IDC_LISTVIEW, 1, NULL, -50);
-}
-
-VOID _app_initialize (
-	_In_opt_ HWND hwnd
-)
-{
-	ULONG privileges[] = {
-		SE_PROF_SINGLE_PROCESS_PRIVILEGE,
-		SE_INCREASE_QUOTA_PRIVILEGE,
-	};
-
-	if (_r_sys_iselevated ())
-	{
-		_r_sys_setprocessprivilege (hwnd, NtCurrentProcess (), privileges, RTL_NUMBER_OF (privileges), TRUE);
-	}
-	else
-	{
-		if (hwnd)
-			_r_button_setshield (hwnd, IDC_CLEAN, TRUE);
-	}
-
-	if (!hwnd)
-		return;
-
-	_r_button_setmargins (hwnd, IDC_CLEAN, _r_dc_getwindowdpi (hwnd));
-
-	// configure listview
-	_r_listview_setstyle (hwnd, IDC_LISTVIEW, LVS_EX_FULLROWSELECT | LVS_EX_INFOTIP | LVS_EX_LABELTIP | LVS_EX_DOUBLEBUFFER, TRUE);
-
-	_r_listview_addcolumn (hwnd, IDC_LISTVIEW, 1, NULL, 10, LVCFMT_RIGHT);
-	_r_listview_addcolumn (hwnd, IDC_LISTVIEW, 2, NULL, 10, LVCFMT_LEFT);
-
-	_app_resizecolumns (hwnd);
-
-	// configure listview
-	for (INT i = 0, k = 0; i < 3; i++)
-	{
-		_r_listview_addgroup (hwnd, IDC_LISTVIEW, i, _r_locale_getstring (IDS_GROUP_1 + i), 0, LVGS_COLLAPSIBLE, LVGS_COLLAPSIBLE);
-
-		for (INT j = 0; j < 3; j++)
-		{
-			_r_listview_additem (hwnd, IDC_LISTVIEW, k++, _r_locale_getstring (IDS_ITEM_1 + j), I_DEFAULT, i, 0);
-		}
-	}
-
-	// settings
-	_r_settings_addpage (IDD_SETTINGS_GENERAL, IDS_SETTINGS_GENERAL);
-	_r_settings_addpage (IDD_SETTINGS_MEMORY, IDS_SETTINGS_MEMORY);
-	_r_settings_addpage (IDD_SETTINGS_APPEARANCE, IDS_SETTINGS_APPEARANCE);
-	_r_settings_addpage (IDD_SETTINGS_TRAY, IDS_SETTINGS_TRAY);
-	_r_settings_addpage (IDD_SETTINGS_ADVANCED, IDS_TITLE_ADVANCED);
-}
-
-INT_PTR CALLBACK DlgProc (
-	_In_ HWND hwnd,
-	_In_ UINT msg,
-	_In_ WPARAM wparam,
-	_In_ LPARAM lparam
-)
-{
-	switch (msg)
-	{
-		case WM_INITDIALOG:
-		{
-			_r_app_sethwnd (hwnd); // HACK!!!
-
-			_app_initialize (hwnd);
-
-			_r_sys_settimer (hwnd, UID, TIMER, &_app_timercallback);
-
-			break;
-		}
-
-		case WM_DESTROY:
-		{
-			KillTimer (hwnd, UID);
-
-			_r_tray_destroy (hwnd, &GUID_TrayIcon);
-
-			PostQuitMessage (0);
-
-			break;
-		}
-
-		case RM_INITIALIZE:
-		{
-			HMENU hmenu;
-
-			hmenu = GetMenu (hwnd);
-
-			if (hmenu)
-			{
-				_r_menu_checkitem (hmenu, IDM_ALWAYSONTOP_CHK, 0, MF_BYCOMMAND, _r_config_getboolean (L"AlwaysOnTop", FALSE, NULL));
-				_r_menu_checkitem (hmenu, IDM_USEDARKTHEME, 0, MF_BYCOMMAND, _r_theme_isenabled ());
-				_r_menu_checkitem (hmenu, IDM_LOADONSTARTUP_CHK, 0, MF_BYCOMMAND, _r_autorun_isenabled ());
-				_r_menu_checkitem (hmenu, IDM_STARTMINIMIZED_CHK, 0, MF_BYCOMMAND, _r_config_getboolean (L"IsStartMinimized", FALSE, NULL));
-				_r_menu_checkitem (hmenu, IDM_REDUCTCONFIRMATION_CHK, 0, MF_BYCOMMAND, _r_config_getboolean (L"IsShowReductConfirmation", TRUE, NULL));
-				_r_menu_checkitem (hmenu, IDM_SKIPUACWARNING_CHK, 0, MF_BYCOMMAND, _r_skipuac_isenabled ());
-				_r_menu_checkitem (hmenu, IDM_CHECKUPDATES_CHK, 0, MF_BYCOMMAND, _r_update_isenabled (FALSE));
-
-				if (!_r_sys_iselevated ())
-					_r_menu_enableitem (hmenu, IDM_SKIPUACWARNING_CHK, FALSE, FALSE);
-			}
-
-			_app_iconinit (_r_dc_gettaskbardpi ());
-
-			_r_tray_create (hwnd, &GUID_TrayIcon, RM_TRAYICON, _app_iconcreate (0), _r_app_getname (), FALSE);
-
-			_app_iconredraw (hwnd);
-
-			break;
-		}
-
-		case RM_INITIALIZE_POST:
-		{
-			if (_r_sys_iselevated ())
-				_app_hotkeyinit (hwnd);
-
-			break;
-		}
-
-		case RM_TASKBARCREATED:
-		{
-			_app_iconinit (_r_dc_gettaskbardpi ());
-
-			_r_tray_create (hwnd, &GUID_TrayIcon, RM_TRAYICON, _app_iconcreate (0), _r_app_getname (), FALSE);
-
-			_app_iconredraw (hwnd);
-
-			break;
-		}
-
-		case RM_LOCALIZE:
-		{
-			// localize menu
-			HMENU hmenu;
-
-			hmenu = GetMenu (hwnd);
-
-			if (hmenu)
-			{
-				_r_menu_setitemtext (hmenu, 0, TRUE, _r_locale_getstring (IDS_FILE));
-				_r_menu_setitemtext (hmenu, 1, TRUE, _r_locale_getstring (IDS_VIEW));
-				_r_menu_setitemtext (hmenu, 2, TRUE, _r_locale_getstring (IDS_SETTINGS));
-				_r_menu_setitemtext (hmenu, 3, TRUE, _r_locale_getstring (IDS_HELP));
-
-				_r_menu_setitemtextformat (hmenu, IDM_SETTINGS, FALSE, L"%s...\tF2", _r_locale_getstring (IDS_SETTINGS));
-				_r_menu_setitemtext (hmenu, IDM_EXIT, FALSE, _r_locale_getstring (IDS_EXIT));
-				_r_menu_setitemtext (hmenu, IDM_ALWAYSONTOP_CHK, FALSE, _r_locale_getstring (IDS_ALWAYSONTOP_CHK));
-				_r_menu_setitemtext (hmenu, IDM_LOADONSTARTUP_CHK, FALSE, _r_locale_getstring (IDS_LOADONSTARTUP_CHK));
-				_r_menu_setitemtext (hmenu, IDM_USEDARKTHEME, FALSE, _r_locale_getstring (IDS_USEDARKTHEME));
-				_r_menu_setitemtext (hmenu, IDM_STARTMINIMIZED_CHK, FALSE, _r_locale_getstring (IDS_STARTMINIMIZED_CHK));
-				_r_menu_setitemtext (hmenu, IDM_REDUCTCONFIRMATION_CHK, FALSE, _r_locale_getstring (IDS_REDUCTCONFIRMATION_CHK));
-				_r_menu_setitemtext (hmenu, IDM_SKIPUACWARNING_CHK, FALSE, _r_locale_getstring (IDS_SKIPUACWARNING_CHK));
-				_r_menu_setitemtext (hmenu, IDM_CHECKUPDATES_CHK, FALSE, _r_locale_getstring (IDS_CHECKUPDATES_CHK));
-				_r_menu_setitemtextformat (GetSubMenu (hmenu, LANG_SUBMENU), LANG_MENU, TRUE, L"%s (Language)", _r_locale_getstring (IDS_LANGUAGE));
-				_r_menu_setitemtext (hmenu, IDM_WEBSITE, FALSE, _r_locale_getstring (IDS_WEBSITE));
-				_r_menu_setitemtext (hmenu, IDM_CHECKUPDATES, FALSE, _r_locale_getstring (IDS_CHECKUPDATES));
-				_r_menu_setitemtextformat (hmenu, IDM_ABOUT, FALSE, L"%s\tF1", _r_locale_getstring (IDS_ABOUT));
-			}
-
-			// configure listview
-			for (INT i = 0, k = 0; i < 3; i++)
-			{
-				_r_listview_setgroup (hwnd, IDC_LISTVIEW, i, _r_locale_getstring (IDS_GROUP_1 + i), 0, 0);
-
-				for (INT j = 0; j < 3; j++)
-				{
-					_r_listview_setitem (hwnd, IDC_LISTVIEW, k++, 0, _r_locale_getstring (IDS_ITEM_1 + j), I_DEFAULT, I_DEFAULT, I_DEFAULT);
-				}
-			}
-
-			// configure button
-			_r_ctrl_setstring (hwnd, IDC_CLEAN, _r_locale_getstring (IDS_CLEAN));
-
-			// enum localizations
-			if (hmenu)
-				_r_locale_enum (GetSubMenu (hmenu, LANG_SUBMENU), LANG_MENU, IDX_LANGUAGE);
-
-			break;
-		}
-
-		case WM_DPICHANGED:
-		{
-			_app_iconinit (_r_dc_gettaskbardpi ());
-			_app_iconredraw (hwnd);
-
-			_app_resizecolumns (hwnd);
-
-			if (!_r_sys_iselevated ())
-				_r_button_setmargins (hwnd, IDC_CLEAN, LOWORD (wparam));
-
-			break;
-		}
-
-		case WM_PAINT:
-		{
-			PAINTSTRUCT ps;
-			HDC hdc;
-
-			hdc = BeginPaint (hwnd, &ps);
-
-			if (!hdc)
-				break;
-
-			_r_dc_drawwindow (hdc, hwnd, TRUE);
-
-			EndPaint (hwnd, &ps);
-
-			break;
-		}
-
-		case WM_HOTKEY:
-		{
-			if (wparam == UID)
-				_app_memoryclean (hwnd, SOURCE_HOTKEY, 0);
-
-			break;
-		}
-
-		case WM_SHOWWINDOW:
-		{
-			if (wparam)
-				_app_iconredraw (hwnd);
-
-			break;
-		}
-
-		case WM_NOTIFY:
-		{
-			LPNMHDR nmlp = (LPNMHDR)lparam;
-
-			switch (nmlp->code)
-			{
-				case BCN_DROPDOWN:
-				{
-					R_RECTANGLE rectangle;
-					WCHAR buffer[0x100];
-					RECT rect;
-					HMENU hmenu;
-
-					hmenu = CreatePopupMenu ();
-
-					if (!hmenu)
-						break;
-
-					_r_menu_additem (hmenu, IDM_CLEAN_WORKINGSET, _r_locale_getstring (IDS_MEMREGION_WORKINGSET));
-					_r_menu_additem (hmenu, IDM_CLEAN_SYSTEMFILECACHE, _r_locale_getstring (IDS_MEMREGION_SYSTEMFILECACHE));
-					_r_menu_additem (hmenu, IDM_CLEAN_MODIFIEDFILECACHE, _r_locale_getstring (IDS_MEMREGION_MODIFIEDFILECACHE));
-
-					_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s*", _r_locale_getstring (IDS_MEMREGION_MODIFIEDLIST));
-					_r_menu_additem (hmenu, IDM_CLEAN_MODIFIEDLIST, buffer);
-
-					_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s*", _r_locale_getstring (IDS_MEMREGION_STANDBYLIST));
-					_r_menu_additem (hmenu, IDM_CLEAN_STANDBYLIST, _r_locale_getstring (IDS_MEMREGION_STANDBYLIST));
-
-					_r_menu_additem (hmenu, IDM_CLEAN_STANDBYLISTPRIORITY0, _r_locale_getstring (IDS_MEMREGION_STANDBYLISTPRIORITY0));
-
-					_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s (win8.1+)", _r_locale_getstring (IDS_MEMREGION_REGISTRYCACHE));
-					_r_menu_additem (hmenu, IDM_CLEAN_REGISTRYCACHE, buffer);
-
-					_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s (win10+)", _r_locale_getstring (IDS_MEMREGION_COMBINEMEMORYLISTS));
-					_r_menu_additem (hmenu, IDM_CLEAN_COMBINEMEMORYLISTS, buffer);
-
-					if (_r_sys_isosversionlower (WINDOWS_8_1))
-						_r_menu_enableitem (hmenu, IDM_CLEAN_REGISTRYCACHE, FALSE, FALSE);
-
-					if (_r_sys_isosversionlower (WINDOWS_10))
-						_r_menu_enableitem (hmenu, IDM_CLEAN_COMBINEMEMORYLISTS, FALSE, FALSE);
-
-					if (GetClientRect (nmlp->hwndFrom, &rect))
-					{
-						ClientToScreen (nmlp->hwndFrom, (PPOINT)&rect);
-
-						_r_wnd_recttorectangle (&rectangle, &rect);
-						_r_wnd_adjustrectangletoworkingarea (&rectangle, nmlp->hwndFrom);
-						_r_wnd_rectangletorect (&rect, &rectangle);
-
-						_r_menu_popup (hmenu, hwnd, (PPOINT)&rect, 0);
-					}
-
-					DestroyMenu (hmenu);
+					DestroyWindow (hwnd);
 
 					break;
-				}
-
-				case NM_CUSTOMDRAW:
-				{
-					LPNMLVCUSTOMDRAW lpnmlv = (LPNMLVCUSTOMDRAW)lparam;
-					LONG_PTR result = CDRF_DODEFAULT;
-					ULONG value;
-
-					if (nmlp->idFrom != IDC_LISTVIEW)
-						break;
-
-					switch (lpnmlv->nmcd.dwDrawStage)
-					{
-						case CDDS_PREPAINT:
-						{
-							result = (CDRF_NOTIFYPOSTPAINT | CDRF_NOTIFYITEMDRAW);
-							break;
-						}
-
-						case CDDS_ITEMPREPAINT:
-						{
-							value = (ULONG)lpnmlv->nmcd.lItemlParam;
-
-							if (value >= _app_getdangervalue ())
-							{
-								lpnmlv->clrText = _r_config_getulong (L"TrayColorDanger", TRAY_COLOR_DANGER, NULL);
-
-								result = (CDRF_NOTIFYPOSTPAINT | CDRF_NEWFONT);
-							}
-							else if (value >= _app_getwarningvalue ())
-							{
-								lpnmlv->clrText = _r_config_getulong (L"TrayColorWarning", TRAY_COLOR_WARNING, NULL);
-
-								result = (CDRF_NOTIFYPOSTPAINT | CDRF_NEWFONT);
-							}
-
-							break;
-						}
-					}
-
-					SetWindowLongPtrW (hwnd, DWLP_MSGRESULT, result);
-
-					return result;
 				}
 			}
 
@@ -2024,49 +1005,9 @@ INT_PTR CALLBACK DlgProc (
 			switch (LOWORD (lparam))
 			{
 				case NIN_KEYSELECT:
+				case WM_LBUTTONDBLCLK:
 				{
-					if (GetForegroundWindow () != hwnd)
-						_r_wnd_toggle (hwnd, TRUE);
-
-					break;
-				}
-
-				case WM_LBUTTONDOWN:
-				case WM_MBUTTONDOWN:
-				{
-					R_STRINGREF taskmgr_sr = PR_STRINGREF_INIT (L"taskmgr.exe");
-					LONG action;
-
-					if (LOWORD (lparam) == WM_MBUTTONDOWN)
-					{
-						action = _r_config_getlong (L"TrayActionMc", 1, NULL);
-					}
-					else
-					{
-						action = _r_config_getlong (L"TrayActionDc", 0, NULL);
-					}
-
-					switch (action)
-					{
-						case 1:
-						{
-							_app_memoryclean (hwnd, SOURCE_MANUAL, 0);
-							break;
-						}
-
-						case 2:
-						{
-							_r_sys_createprocess (&taskmgr_sr, NULL, NULL, FALSE);
-							break;
-						}
-
-						default:
-						{
-							_r_wnd_toggle (hwnd, FALSE);
-							break;
-						}
-					}
-
+					ShowWindow (hwnd, SW_SHOW);
 					SetForegroundWindow (hwnd);
 
 					break;
@@ -2074,113 +1015,7 @@ INT_PTR CALLBACK DlgProc (
 
 				case WM_CONTEXTMENU:
 				{
-					HMENU hmenu, hsubmenu, hsubmenu_interval, hsubmenu_limit, hsubmenu_region;
-					ULONG mask;
-
-					SetForegroundWindow (hwnd); // don't touch
-
-					hmenu = LoadMenuW (_r_sys_getimagebase (), MAKEINTRESOURCEW (IDM_TRAY));
-
-					if (!hmenu)
-						break;
-
-					hsubmenu = GetSubMenu (hmenu, 0);
-
-					if (!hsubmenu)
-						break;
-
-					hsubmenu_region = GetSubMenu (hsubmenu, TRAY_SUBMENU_1);
-					hsubmenu_limit = GetSubMenu (hsubmenu, TRAY_SUBMENU_2);
-					hsubmenu_interval = GetSubMenu (hsubmenu, TRAY_SUBMENU_3);
-
-					// localize
-					_r_menu_setitemtext (hsubmenu, IDM_TRAY_SHOW, FALSE, _r_locale_getstring (IDS_TRAY_SHOW));
-					_r_menu_setitemtextformat (hsubmenu, IDM_TRAY_CLEAN, FALSE, L"%s...", _r_locale_getstring (IDS_CLEAN));
-					_r_menu_setitemtext (hsubmenu, TRAY_SUBMENU_1, TRUE, _r_locale_getstring (IDS_TRAY_POPUP_1));
-					_r_menu_setitemtext (hsubmenu, TRAY_SUBMENU_2, TRUE, _r_locale_getstring (IDS_TRAY_POPUP_2));
-					_r_menu_setitemtext (hsubmenu, TRAY_SUBMENU_3, TRUE, _r_locale_getstring (IDS_TRAY_POPUP_3));
-					_r_menu_setitemtextformat (hsubmenu, IDM_TRAY_SETTINGS, FALSE, L"%s...", _r_locale_getstring (IDS_SETTINGS));
-					_r_menu_setitemtext (hsubmenu, IDM_TRAY_WEBSITE, FALSE, _r_locale_getstring (IDS_WEBSITE));
-					_r_menu_setitemtext (hsubmenu, IDM_TRAY_ABOUT, FALSE, _r_locale_getstring (IDS_ABOUT));
-					_r_menu_setitemtext (hsubmenu, IDM_TRAY_EXIT, FALSE, _r_locale_getstring (IDS_EXIT));
-
-					// configure submenu #1
-					if (hsubmenu_region)
-					{
-						mask = _r_config_getulong (L"ReductMask2", REDUCT_MASK_DEFAULT, NULL);
-
-						_r_menu_setitemtext (hsubmenu_region, IDM_WORKINGSET_CHK, FALSE, _r_locale_getstring (IDS_MEMREGION_WORKINGSET));
-						_r_menu_setitemtext (hsubmenu_region, IDM_SYSTEMFILECACHE_CHK, FALSE, _r_locale_getstring (IDS_MEMREGION_SYSTEMFILECACHE));
-						_r_menu_setitemtext (hsubmenu_region, IDM_MODIFIEDFILECACHE_CHK, FALSE, _r_locale_getstring (IDS_MEMREGION_MODIFIEDFILECACHE));
-						_r_menu_setitemtextformat (hsubmenu_region, IDM_MODIFIEDLIST_CHK, FALSE, L"%s*", _r_locale_getstring (IDS_MEMREGION_MODIFIEDLIST));
-						_r_menu_setitemtextformat (hsubmenu_region, IDM_STANDBYLIST_CHK, FALSE, L"%s*", _r_locale_getstring (IDS_MEMREGION_STANDBYLIST));
-						_r_menu_setitemtext (hsubmenu_region, IDM_STANDBYLISTPRIORITY0_CHK, FALSE, _r_locale_getstring (IDS_MEMREGION_STANDBYLISTPRIORITY0));
-						_r_menu_setitemtextformat (hsubmenu_region, IDM_REGISTRYCACHE_CHK, FALSE, L"%s (win8.1+)", _r_locale_getstring (IDS_MEMREGION_REGISTRYCACHE));
-						_r_menu_setitemtextformat (hsubmenu_region, IDM_COMBINEMEMORYLISTS_CHK, FALSE, L"%s (win10+)", _r_locale_getstring (IDS_MEMREGION_COMBINEMEMORYLISTS));
-
-						_r_menu_checkitem (hsubmenu_region, IDM_WORKINGSET_CHK, 0, MF_BYCOMMAND, (mask & REDUCT_WORKINGSET) == REDUCT_WORKINGSET);
-						_r_menu_checkitem (hsubmenu_region, IDM_SYSTEMFILECACHE_CHK, 0, MF_BYCOMMAND, (mask & REDUCT_SYSTEMFILECACHE) == REDUCT_SYSTEMFILECACHE);
-						_r_menu_checkitem (hsubmenu_region, IDM_MODIFIEDLIST_CHK, 0, MF_BYCOMMAND, (mask & REDUCT_MODIFIEDLIST) == REDUCT_MODIFIEDLIST);
-						_r_menu_checkitem (hsubmenu_region, IDM_STANDBYLIST_CHK, 0, MF_BYCOMMAND, (mask & REDUCT_STANDBYLIST) == REDUCT_STANDBYLIST);
-						_r_menu_checkitem (hsubmenu_region, IDM_STANDBYLISTPRIORITY0_CHK, 0, MF_BYCOMMAND, (mask & REDUCT_STANDBYPRIORITY0LIST) == REDUCT_STANDBYPRIORITY0LIST);
-						_r_menu_checkitem (hsubmenu_region, IDM_MODIFIEDFILECACHE_CHK, 0, MF_BYCOMMAND, (mask & REDUCT_MODIFIEDFILECACHE) == REDUCT_MODIFIEDFILECACHE);
-						_r_menu_checkitem (hsubmenu_region, IDM_REGISTRYCACHE_CHK, 0, MF_BYCOMMAND, (mask & REDUCT_REGISTRYCACHE) == REDUCT_REGISTRYCACHE);
-						_r_menu_checkitem (hsubmenu_region, IDM_COMBINEMEMORYLISTS_CHK, 0, MF_BYCOMMAND, (mask & REDUCT_COMBINEMEMORYLISTS) == REDUCT_COMBINEMEMORYLISTS);
-
-						if (!_r_sys_iselevated ())
-						{
-							_r_menu_enableitem (hsubmenu_region, IDM_WORKINGSET_CHK, FALSE, FALSE);
-							_r_menu_enableitem (hsubmenu_region, IDM_SYSTEMFILECACHE_CHK, FALSE, FALSE);
-							_r_menu_enableitem (hsubmenu_region, IDM_MODIFIEDFILECACHE_CHK, FALSE, FALSE);
-							_r_menu_enableitem (hsubmenu_region, IDM_MODIFIEDLIST_CHK, FALSE, FALSE);
-							_r_menu_enableitem (hsubmenu_region, IDM_STANDBYLIST_CHK, FALSE, FALSE);
-							_r_menu_enableitem (hsubmenu_region, IDM_STANDBYLISTPRIORITY0_CHK, FALSE, FALSE);
-							_r_menu_enableitem (hsubmenu_region, IDM_REGISTRYCACHE_CHK, FALSE, FALSE);
-							_r_menu_enableitem (hsubmenu_region, IDM_COMBINEMEMORYLISTS_CHK, FALSE, FALSE);
-						}
-
-						// flush registry cache (win8.1+)
-						if (_r_sys_isosversionlower (WINDOWS_8_1))
-							_r_menu_enableitem (hsubmenu_region, IDM_REGISTRYCACHE_CHK, FALSE, FALSE);
-
-						// combine memory lists (win10+)
-						if (_r_sys_isosversionlower (WINDOWS_10))
-							_r_menu_enableitem (hsubmenu_region, IDM_COMBINEMEMORYLISTS_CHK, FALSE, FALSE);
-					}
-
-					// configure submenu #2
-					if (hsubmenu_limit)
-					{
-						_app_generate_menu (
-							hsubmenu_limit,
-							IDX_TRAY_POPUP_1,
-							limits_arr,
-							RTL_NUMBER_OF (limits_arr),
-							L"%" TEXT (PR_ULONG) L"%%",
-							_app_getlimitvalue (),
-							99,
-							_r_config_getboolean (L"AutoreductEnable", FALSE, NULL)
-						);
-					}
-
-					// configure submenu #3
-					if (hsubmenu_interval)
-					{
-						_app_generate_menu (
-							hsubmenu_interval,
-							IDX_TRAY_POPUP_2,
-							intervals_arr,
-							RTL_NUMBER_OF (intervals_arr),
-							L"%" TEXT (PR_LONG64) L" min.",
-							_app_getintervalvalue (),
-							1440,
-							_r_config_getboolean (L"AutoreductIntervalEnable", FALSE, NULL)
-						);
-					}
-
-					_r_menu_popup (hsubmenu, hwnd, NULL, 0);
-
-					DestroyMenu (hmenu);
+					_app_showtraymenu (hwnd);
 
 					break;
 				}
@@ -2189,337 +1024,59 @@ INT_PTR CALLBACK DlgProc (
 			break;
 		}
 
-		case WM_COMMAND:
+		case WM_CTLCOLORSTATIC:
 		{
-			INT ctrl_id = LOWORD (wparam);
-			INT notify_code = HIWORD (wparam);
-
-			if (notify_code == 0 && ctrl_id >= IDX_LANGUAGE && ctrl_id <= IDX_LANGUAGE + (INT)(INT_PTR)_r_locale_getcount () + 1)
+			// low-threshold warning is painted red, everything else keeps the theme
+			if ((HWND)lparam == GetDlgItem (hwnd, IDC_AUTO_WARN))
 			{
-				HMENU hmenu, hsubmenu;
+				HDC hdc = (HDC)wparam;
 
-				hmenu = GetMenu (hwnd);
+				SetBkMode (hdc, TRANSPARENT);
+				SetTextColor (hdc, RGB (0xE0, 0x20, 0x20));
 
-				if (hmenu)
-				{
-					hsubmenu = GetSubMenu (GetSubMenu (hmenu, LANG_SUBMENU), LANG_MENU);
-
-					if (hsubmenu)
-						_r_locale_apply (hsubmenu, ctrl_id, IDX_LANGUAGE);
-				}
-
-				return FALSE;
-			}
-			else if ((ctrl_id >= IDX_TRAY_POPUP_1 && ctrl_id <= IDX_TRAY_POPUP_1 + (INT)RTL_NUMBER_OF (limits_arr) - 1))
-			{
-				ULONG_PTR idx = (ULONG_PTR)(ctrl_id - IDX_TRAY_POPUP_1);
-
-				_r_config_setboolean (L"AutoreductEnable", TRUE, NULL);
-				_r_config_setlong (L"AutoreductValue", limits_arr[idx], NULL);
-
-				return FALSE;
-			}
-			else if ((ctrl_id >= IDX_TRAY_POPUP_2 && ctrl_id <= IDX_TRAY_POPUP_2 + (INT)RTL_NUMBER_OF (intervals_arr) - 1))
-			{
-				ULONG_PTR idx = (ULONG_PTR)(ctrl_id - IDX_TRAY_POPUP_2);
-
-				_r_config_setboolean (L"AutoreductIntervalEnable", TRUE, NULL);
-				_r_config_setlong (L"AutoreductIntervalValue", intervals_arr[idx], NULL);
-
-				return FALSE;
+				return (INT_PTR)GetStockObject (HOLLOW_BRUSH);
 			}
 
-			switch (ctrl_id)
+			break;
+		}
+
+		case WM_CLOSE:
+		{
+			if (!is_exiting)
 			{
-				case IDM_ALWAYSONTOP_CHK:
+				ShowWindow (hwnd, SW_HIDE);
+
+				if (!is_trayhintshown)
 				{
-					BOOLEAN new_val = _r_config_invertboolean (L"AlwaysOnTop", FALSE, NULL);
+					_r_tray_popup (hwnd, &GUID_TRAYICON, NIIF_INFO, L_APP_TITLE, L_TRAY_MINIMIZED);
 
-					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, new_val);
-
-					_r_wnd_top (hwnd, new_val);
-
-					break;
+					is_trayhintshown = TRUE;
 				}
 
-				case IDM_STARTMINIMIZED_CHK:
-				{
-					BOOLEAN new_val = _r_config_invertboolean (L"IsStartMinimized", FALSE, NULL);
-
-					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, new_val);
-
-					break;
-				}
-
-				case IDM_REDUCTCONFIRMATION_CHK:
-				{
-					BOOLEAN new_val = _r_config_invertboolean (L"IsShowReductConfirmation", TRUE, NULL);
-
-					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, new_val);
-
-					break;
-				}
-
-				case IDM_LOADONSTARTUP_CHK:
-				{
-					_r_autorun_enable (hwnd, !_r_autorun_isenabled ());
-					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, _r_autorun_isenabled ());
-
-					break;
-				}
-
-				case IDM_USEDARKTHEME:
-				{
-					BOOLEAN is_enabled = !_r_theme_isenabled ();
-
-					_r_theme_enable (hwnd, is_enabled);
-					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, is_enabled);
-
-					break;
-				}
-
-				case IDM_SKIPUACWARNING_CHK:
-				{
-					_r_skipuac_enable (hwnd, !_r_skipuac_isenabled ());
-					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, _r_skipuac_isenabled ());
-
-					break;
-				}
-
-				case IDM_CHECKUPDATES_CHK:
-				{
-					BOOLEAN new_val = !_r_update_isenabled (FALSE);
-
-					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, new_val);
-					_r_update_enable (new_val);
-
-					break;
-				}
-
-				case IDM_WORKINGSET_CHK:
-				case IDM_SYSTEMFILECACHE_CHK:
-				case IDM_MODIFIEDFILECACHE_CHK:
-				case IDM_MODIFIEDLIST_CHK:
-				case IDM_STANDBYLIST_CHK:
-				case IDM_STANDBYLISTPRIORITY0_CHK:
-				case IDM_REGISTRYCACHE_CHK:
-				case IDM_COMBINEMEMORYLISTS_CHK:
-				{
-					ULONG mask, new_mask = 0;
-
-					mask = _r_config_getulong (L"ReductMask2", REDUCT_MASK_DEFAULT, NULL);
-
-					switch (ctrl_id)
-					{
-						case IDM_WORKINGSET_CHK:
-						{
-							new_mask = REDUCT_WORKINGSET;
-							break;
-						}
-
-						case IDM_SYSTEMFILECACHE_CHK:
-						{
-							new_mask = REDUCT_SYSTEMFILECACHE;
-							break;
-						}
-
-						case IDM_MODIFIEDFILECACHE_CHK:
-						{
-							new_mask = REDUCT_MODIFIEDFILECACHE;
-							break;
-						}
-
-						case IDM_MODIFIEDLIST_CHK:
-						{
-							new_mask = REDUCT_MODIFIEDLIST;
-							break;
-						}
-
-						case IDM_STANDBYLIST_CHK:
-						{
-							new_mask = REDUCT_STANDBYLIST;
-							break;
-						}
-
-						case IDM_STANDBYLISTPRIORITY0_CHK:
-						{
-							new_mask = REDUCT_STANDBYPRIORITY0LIST;
-							break;
-						}
-
-						case IDM_REGISTRYCACHE_CHK:
-						{
-							new_mask = REDUCT_REGISTRYCACHE;
-							break;
-						}
-
-						case IDM_COMBINEMEMORYLISTS_CHK:
-						{
-							new_mask = REDUCT_COMBINEMEMORYLISTS;
-							break;
-						}
-
-						default:
-						{
-							return FALSE;
-						}
-					}
-
-					if ((ctrl_id == IDM_STANDBYLIST_CHK && !(mask & REDUCT_STANDBYLIST)) || (ctrl_id == IDM_MODIFIEDLIST_CHK && !(mask & REDUCT_MODIFIEDLIST)))
-					{
-						if (!_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_QUESTION_WARNING), NULL, L"IsShowWarningConfirmation", FALSE))
-							return FALSE;
-					}
-
-					_r_config_setulong (L"ReductMask2", (mask & new_mask) != 0 ? (mask & ~new_mask) : (mask | new_mask), NULL);
-
-					break;
-				}
-
-				case IDM_CLEAN_WORKINGSET:
-				case IDM_CLEAN_SYSTEMFILECACHE:
-				case IDM_CLEAN_MODIFIEDFILECACHE:
-				case IDM_CLEAN_MODIFIEDLIST:
-				case IDM_CLEAN_STANDBYLIST:
-				case IDM_CLEAN_STANDBYLISTPRIORITY0:
-				case IDM_CLEAN_REGISTRYCACHE:
-				case IDM_CLEAN_COMBINEMEMORYLISTS:
-				{
-					switch (ctrl_id)
-					{
-						case IDM_CLEAN_WORKINGSET:
-						{
-							_app_memoryclean (hwnd, SOURCE_CMDLINE, REDUCT_WORKINGSET);
-							break;
-						}
-
-						case IDM_CLEAN_SYSTEMFILECACHE:
-						{
-							_app_memoryclean (hwnd, SOURCE_CMDLINE, REDUCT_SYSTEMFILECACHE);
-							break;
-						}
-
-						case IDM_CLEAN_MODIFIEDFILECACHE:
-						{
-							_app_memoryclean (hwnd, SOURCE_CMDLINE, REDUCT_MODIFIEDFILECACHE);
-							break;
-						}
-
-						case IDM_CLEAN_MODIFIEDLIST:
-						{
-							_app_memoryclean (hwnd, SOURCE_CMDLINE, REDUCT_MODIFIEDLIST);
-							break;
-						}
-
-						case IDM_CLEAN_STANDBYLIST:
-						{
-							_app_memoryclean (hwnd, SOURCE_CMDLINE, REDUCT_STANDBYLIST);
-							break;
-						}
-
-						case IDM_CLEAN_STANDBYLISTPRIORITY0:
-						{
-							_app_memoryclean (hwnd, SOURCE_CMDLINE, REDUCT_STANDBYPRIORITY0LIST);
-							break;
-						}
-
-						case IDM_CLEAN_REGISTRYCACHE:
-						{
-							_app_memoryclean (hwnd, SOURCE_CMDLINE, REDUCT_REGISTRYCACHE);
-							break;
-						}
-
-						case IDM_CLEAN_COMBINEMEMORYLISTS:
-						{
-							_app_memoryclean (hwnd, SOURCE_CMDLINE, REDUCT_COMBINEMEMORYLISTS);
-							break;
-						}
-
-						default:
-						{
-							return FALSE;
-						}
-					}
-
-					break;
-				}
-
-				case IDM_TRAY_DISABLE_1:
-				{
-					_r_config_invertboolean (L"AutoreductEnable", FALSE, NULL);
-					break;
-				}
-
-				case IDM_TRAY_DISABLE_2:
-				{
-					_r_config_invertboolean (L"AutoreductIntervalEnable", FALSE, NULL);
-					break;
-				}
-
-				case IDM_SETTINGS:
-				case IDM_TRAY_SETTINGS:
-				{
-					_r_settings_createwindow (hwnd, &SettingsProc, 0);
-					break;
-				}
-
-				case IDM_EXIT:
-				case IDM_TRAY_EXIT:
-				{
-					DestroyWindow (hwnd);
-					break;
-				}
-
-				case IDCANCEL: // process Esc key
-				case IDM_TRAY_SHOW:
-				{
-					_r_wnd_toggle (hwnd, FALSE);
-					break;
-				}
-
-				case IDOK: // process Enter key
-				case IDC_CLEAN:
-				case IDM_TRAY_CLEAN:
-				{
-					if (_r_sys_iselevated ())
-					{
-						_app_memoryclean (hwnd, SOURCE_MANUAL, 0);
-					}
-					else
-					{
-						if (_r_app_runasadmin ())
-						{
-							DestroyWindow (hwnd);
-						}
-						else
-						{
-							_r_show_message (hwnd, MB_OK | MB_ICONSTOP, _r_locale_getstring (IDS_STATUS_NOPRIVILEGES), NULL);
-						}
-					}
-
-					break;
-				}
-
-				case IDM_WEBSITE:
-				case IDM_TRAY_WEBSITE:
-				{
-					_r_shell_opendefault (_r_app_getwebsite_url ());
-					break;
-				}
-
-				case IDM_CHECKUPDATES:
-				{
-					_r_update_check (hwnd);
-					break;
-				}
-
-				case IDM_ABOUT:
-				case IDM_TRAY_ABOUT:
-				{
-					_r_show_aboutmessage (hwnd);
-					break;
-				}
+				return TRUE;
 			}
+
+			break;
+		}
+
+		case WM_DESTROY:
+		{
+			KillTimer (hwnd, TIMER_UID);
+
+			_r_tray_destroy (hwnd, &GUID_TRAYICON);
+
+			if (tray_icon)
+			{
+				DestroyIcon (tray_icon);
+
+				tray_icon = NULL;
+			}
+
+			_wl_unlockfile ();
+
+			_wl_free ();
+
+			PostQuitMessage (0);
 
 			break;
 		}
@@ -2528,58 +1085,15 @@ INT_PTR CALLBACK DlgProc (
 	return FALSE;
 }
 
-BOOLEAN NTAPI _app_parseargs (
-	_In_ R_CMDLINE_INFO_CLASS type
-)
-{
-	PR_STRING clean_args;
-	ULONG mask = 0;
-
-	switch (type)
-	{
-		case CmdlineClean:
-		{
-			_r_sys_getopt (_r_sys_getcommandline (), L"clean", &clean_args);
-
-			if (clean_args)
-			{
-				if (_r_str_isequal2 (&clean_args->sr, L"full", TRUE))
-					mask = REDUCT_MASK_ALL;
-
-				_r_obj_dereference (clean_args);
-			}
-
-			if (mask == 0)
-				mask = REDUCT_MASK_DEFAULT;
-
-			_app_initialize (NULL);
-
-			_app_memoryclean (NULL, SOURCE_CMDLINE, mask);
-
-			return TRUE;
-		}
-
-		case CmdlineHelp:
-		{
-			_r_show_message (NULL, MB_OK | MB_ICONINFORMATION, NULL, L"Available options for memreduct.exe:\r\n\r\n-clean - clear default memory regions\r\n" "-clean:full - clear all memory regions");
-
-			return TRUE;
-		}
-	}
-
-	return FALSE;
-}
-
-INT APIENTRY wWinMain (
-	_In_ HINSTANCE hinst,
-	_In_opt_ HINSTANCE prev_hinst,
-	_In_ LPWSTR cmdline,
-	_In_ INT show_cmd
-)
+INT APIENTRY wWinMain (HINSTANCE hinst, HINSTANCE prev_hinst, LPWSTR cmdline, INT show_cmd)
 {
 	HWND hwnd;
 
-	if (!_r_app_initialize (&_app_parseargs))
+	UNREFERENCED_PARAMETER (prev_hinst);
+	UNREFERENCED_PARAMETER (cmdline);
+	UNREFERENCED_PARAMETER (show_cmd);
+
+	if (!_r_app_initialize (NULL))
 		return ERROR_APP_INIT_FAILURE;
 
 	hwnd = _r_app_createwindow (hinst, MAKEINTRESOURCEW (IDD_MAIN), MAKEINTRESOURCEW (IDI_MAIN), &DlgProc);
@@ -2587,5 +1101,5 @@ INT APIENTRY wWinMain (
 	if (!hwnd)
 		return ERROR_APP_INIT_FAILURE;
 
-	return _r_wnd_message_callback (hwnd, MAKEINTRESOURCEW (IDA_MAIN));
+	return (INT)_r_wnd_message_callback (hwnd, NULL);
 }

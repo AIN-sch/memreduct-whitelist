@@ -39,3 +39,12 @@ desktop.ini
 *.tlog
 
 *PVS-Studio*
+
+# local build output
+x64/
+bin/64/
+bin/next/
+*.pdb
+*.ini
+.vs/
+temp/

@@ -1,50 +1,102 @@
-<h1 align="center">Mem Reduct</h1>
+# Mem Reduct 白名单版
 
-<p align="center">
-	<a href="https://github.com/henrypp/memreduct/releases"><img src="https://img.shields.io/github/v/release/henrypp/memreduct?style=flat-square&include_prereleases&label=version" /></a>
-	<a href="https://github.com/henrypp/memreduct/releases"><img src="https://img.shields.io/github/downloads/henrypp/memreduct/total.svg?style=flat-square" /></a>
-	<a href="https://github.com/henrypp/memreduct/issues"><img src="https://img.shields.io/github/issues-raw/henrypp/memreduct.svg?style=flat-square&label=issues" /></a>
-	<a href="https://github.com/henrypp/memreduct/graphs/contributors"><img src="https://img.shields.io/github/contributors/henrypp/memreduct?style=flat-square" /></a>
-	<a href="https://github.com/henrypp/memreduct/blob/master/LICENSE"><img src="https://img.shields.io/github/license/henrypp/memreduct?style=flat-square" /></a>
-</p>
+[Mem Reduct](https://github.com/henrypp/memreduct) 的二改版本：按目录白名单定向清理内存，白名单内的程序（游戏、常驻工具）工作集不动，其余照常清理。
 
--------
+> 本项目是对原作者 [Henry++](https://github.com/henrypp) 的 [memreduct](https://github.com/henrypp/memreduct) 的二次修改，非官方版本。原项目版权与许可（GPL-3.0）完整保留，详见 `LICENSE`。
 
-<p align="center">
-	<img src="/images/memreduct.png?cachefix" />
-</p>
+## 下载
 
-### Description:
-Lightweight real-time memory management application to monitor
-and clean system memory on your computer.
+不用编译，直接取现成 exe：[Releases](https://github.com/AIN-sch/memreduct-whitelist/releases/latest)
 
-The program used undocumented internal system features (Native API) to clear system cache (system working set, working set, standby page lists, modified page lists) with variable result ~10-50%. Application it is compatible with <s>Windows XP SP3</s> Windows 7 SP1 and higher operating systems.
+- `memreduct-whitelist-3.5.3.exe`：单文件，免安装，无运行库依赖
+- `whitelist.txt`：下载后重命名为 `白名单.txt`，与 exe 放同一目录
 
-You can download either the installer or portable version. For correct working you are require administrator rights.
+## 改动点
+
+原版清理工作集是全局一次 `NtSetSystemInformation(SystemMemoryListInformation, MemoryEmptyWorkingSets)`，全系统进程一起压，游戏纹理被驱逐、切回就卡。
+
+本版改动：
+
+- 改为逐进程处理：枚举进程 → 命中白名单直接跳过 → 其余进程压工作集
+- 白名单来自 exe 同目录的 `白名单.txt`，支持目录前缀、完整 exe 路径、环境变量、子进程继承
+- 清理优先走 `ProcessWorkingSetControl` + COMPRESS|STORE（压进内存压缩存储，不写盘），失败回退 `ProcessQuotaLimits`
+- 白名单进程加保护：页优先级提到 5、standby 只清低优先级、临时设硬工作集下限
+- 白名单文件缺失或为空时拒绝清理；运行期锁定该文件（可编辑，不可删改）
+- 界面精简为一个清理按钮 + 自动清理阈值；常驻托盘，图标显示占用数字（绿/黄/红三档）
+- 每次清理写一份报告到 `%TEMP%\memreduct.log`，相同条目自动折叠
+
+## 用法
+
+1. 运行 `memreduct.exe`，UAC 弹窗选「是」（需要管理员权限）
+2. 编辑同目录 `白名单.txt`，每行一个路径；`#` 开头为注释，去掉 `#` 即生效：
 
 ```
-To activate portable mode, create "memreduct.ini" in application folder, or move it from "%APPDATA%\Henry++\Mem Reduct".
+# 目录：该目录及其子目录下所有程序都豁免
+#D:\Steam\steamapps\common\PUBG
+# 单个程序：只豁免这一个 exe
+#D:\Tools\obs64.exe
 ```
 
-### System requirements:
-- Windows 7, 8, 8.1, 10, 11 (64-bit/ARM64)
-- An SSE2-capable CPU
-- <s>KB2533623</s> [KB3063858](https://www.microsoft.com/en-us/download/details.aspx?id=47442) update for Windows 7 was required
+3. 点「立即清理」；勾选「内存占用超过 N% 时自动清理」可常驻后台
+4. 关闭窗口 = 最小化到托盘；托盘右键退出，左键双击恢复窗口
 
-### Donate:
-- [Bitcoin](https://www.blockchain.com/btc/address/1LrRTXPsvHcQWCNZotA9RcwjsGcRghG96c) (BTC)
-- [Ethereum](https://www.blockchain.com/explorer/addresses/eth/0xe2C84A62eb2a4EF154b19bec0c1c106734B95960) (ETH)
-- [Yandex Money](https://yoomoney.ru/to/4100115776040583) (RUB)
-- [Paypal](https://paypal.me/henrypp) (USD)
+## 白名单匹配
 
-### GPG Signature:
-Binaries have GPG signature `memreduct.exe.sig` in application folder.
+- 目录条目覆盖其下全部子目录
+- 完整 exe 路径条目只覆盖该程序
+- 被豁免进程启动的子进程同样豁免（exe 位于别处也算）
+- 按目录分隔符判定边界，`App` 不会误伤 `App2`
 
-- Public key: [pubkey.asc](https://raw.githubusercontent.com/henrypp/builder/master/pubkey.asc) ([pgpkeys.eu](https://pgpkeys.eu/pks/lookup?op=index&fingerprint=on&search=0x5635B5FD))
-- Key ID: 0x5635B5FD
-- Fingerprint: D985 2361 1524 AB29 BE73 30AC 2881 20A7 5635 B5FD
----
-- Website: [github.com/henrypp](https://github.com/henrypp)
-- Support: sforce5@mail.ru
----
-(c) 2011-2026 Henry++
+## 配置
+
+`memreduct.ini` 与 exe 同目录，首次运行自动生成：
+
+| key | 默认 | 说明 |
+|---|---|---|
+| `AutoClean` | 0 | 自动清理开关 |
+| `AutoCleanPercent` | 85 | 自动清理阈值，范围 20-99；低于 50 界面会提示可能反复清理 |
+| `CleanSystemCache` | 1 | 是否顺带清系统文件缓存 |
+| `AllowEmptyWhitelist` | 0 | 置 1 才允许空白名单下清理 |
+| `LogEnable` | 1 | 是否写 `%TEMP%\memreduct.log` |
+| `TrayWarningPercent` | 70 | 托盘黄档起点 |
+| `TrayDangerPercent` | 85 | 托盘红档起点 |
+
+自动清理节奏：越过阈值即清理，两次之间至少 30 秒；若清理后仍高于阈值，每 5 分钟最多再清一次（阈值低于 50 时为 10 分钟）。
+
+## 构建
+
+需要 VS2022（v143）与 Windows SDK：
+
+```
+msbuild memreduct.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+```
+
+`routine` 依赖按 `.gitmodules` 放在上一级目录（`../routine`），与 `memreduct` 同级。
+
+## 实测
+
+**场景**：后台常驻 5 个应用 + 运行 PUBG（PUBG 安装目录写入白名单），自动清理阈值 85%。
+
+**表现**：自动清理触发瞬间游戏无可感知卡顿；游戏纹理未被驱逐，切场景不出现读盘卡顿，1% low 帧有可测提升。
+
+**记录方法**：
+
+1. RTSS 打开 OSD，显示 frametime 与 1% low
+2. 固定同一场景各跑 5 分钟：A 组关闭自动清理，B 组开启自动清理
+3. 对比两组的 1% low 与最大 frametime
+
+**对照组**：原版在同样场景下清理会压掉游戏工作集，切场景时出现明显读盘卡顿。
+
+## 已知限制
+
+- standby list、系统文件缓存、modified page list 是全局接口，没有按进程参数，只能间接规避
+- 受保护进程（PPL、部分 SYSTEM 服务，例如 `AppXSvc` 所在的 svchost）打不开，会跳过并写进日志
+- 清理过程中进程被强制结束时，白名单进程的硬工作集下限会保留到它重启
+
+## 许可
+
+GPL-3.0。原项目：https://github.com/henrypp/memreduct
+
+## 交流
+
+公开技术探讨 Q 群：**1102821216**（问题反馈、使用交流）

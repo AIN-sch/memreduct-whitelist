@@ -1,0 +1,40 @@
+// strings_cn.h
+// Chinese UI strings as \u escapes; '|' marks an explicit line break (\r\n)
+// Copyright (c) 2011-2026 Henry++
+
+#pragma once
+
+#define L_APP_TITLE       L"\u5185\u5B58\u4F18\u5316\uFF08\u767D\u540D\u5355\u7248\uFF09"
+#define L_MEM_USAGE       L"\u5185\u5B58\u5360\u7528"
+#define L_FREE            L"\u53EF\u7528"
+#define L_TOTAL           L"\u603B\u8BA1"
+#define L_BTN_CLEAN       L"\u7ACB\u5373\u6E05\u7406"
+#define L_AUTO_ENABLE     L"\u5185\u5B58\u5360\u7528\u8D85\u8FC7"
+#define L_AUTO_SUFFIX     L"% \u65F6\u81EA\u52A8\u6E05\u7406\uFF0820-99\uFF09"
+#define L_AUTO_WARN       L"\u5EFA\u8BAE\u4E0D\u4F4E\u4E8E 50%\uFF1A\u8FC7\u4F4E\u4F1A\u53CD\u590D\u6E05\u7406\u3001\u53CD\u800C\u9020\u6210\u5361\u987F"
+#define L_SFC_ENABLE      L"\u540C\u65F6\u6E05\u7406\u7CFB\u7EDF\u6587\u4EF6\u7F13\u5B58"
+#define L_HINT            L"\u5173\u95ED\u7A97\u53E3=\u6700\u5C0F\u5316\u5230\u6258\u76D8\uFF0C\u53F3\u952E\u6258\u76D8\u56FE\u6807\u53EF\u9000\u51FA"
+#define L_LEGEND          L"\u6258\u76D8\u989C\u8272\uFF1A\u7EFF \u7A7A\u95F2<%lu%%\u3000\u9EC4 \u8F83\u591A %lu-%lu%%\u3000\u7EA2 \u7D27\u5F20\u2265%lu%%\r\n\u53EF\u5728 memreduct.ini \u8C03\u6574 TrayWarningPercent / TrayDangerPercent"
+#define L_WL_LOADED       L"\u767D\u540D\u5355\uFF1A\u5DF2\u52A0\u8F7D %lu \u6761\u89C4\u5219\r\n\u6587\u4EF6\u5DF2\u9501\u5B9A\uFF08\u53EF\u7F16\u8F91\uFF0C\u4E0D\u53EF\u5220\u9664\uFF09"
+#define L_WL_MISSING      L"\u767D\u540D\u5355\uFF1A\u672A\u627E\u5230 \u767D\u540D\u5355.txt\r\n\u5DF2\u963B\u6B62\u6E05\u7406"
+#define L_WL_EMPTY        L"\u767D\u540D\u5355\uFF1A0 \u6761\u89C4\u5219\r\n\u5DF2\u963B\u6B62\u6E05\u7406"
+#define L_WL_CREATED      L"\u5DF2\u751F\u6210 \u767D\u540D\u5355.txt\uFF0C\u8BF7\u586B\u5199\u8DEF\u5F84"
+#define L_WL_EDIT         L"\u7F16\u8F91\u767D\u540D\u5355"
+#define L_CLEANING        L"\u6B63\u5728\u6E05\u7406\u2026"
+#define L_RESULT          L"\u5DF2\u91CA\u653E %s\r\n\u6E05\u7406 %lu \u4E2A\u8FDB\u7A0B\uFF0C\u8DF3\u8FC7 %lu\uFF0C\u5931\u8D25 %lu"
+#define L_FAIL_LABEL      L"\u5931\u8D25\uFF1A"
+#define L_FAIL_TIP        L"\u660E\u7EC6\u89C1 %TEMP%\\memreduct.log"
+#define L_EDIT_FAILED     L"\u6253\u5F00\u767D\u540D\u5355\u6587\u4EF6\u5931\u8D25"
+#define L_BLOCK_NOWLFILE  L"\u767D\u540D\u5355.txt \u7F3A\u5931\uFF0C\u5DF2\u963B\u6B62\u6E05\u7406\r\n\u5DF2\u91CD\u65B0\u751F\u6210\u6A21\u677F\uFF0C\u8BF7\u586B\u5199\u8DEF\u5F84\u540E\u91CD\u8BD5"
+#define L_BLOCK_EMPTYWL   L"\u767D\u540D\u5355\u4E3A\u7A7A\uFF0C\u5DF2\u963B\u6B62\u6E05\u7406\r\n\u5982\u8981\u6E05\u7406\u5168\u90E8\u5185\u5B58\uFF1Amemreduct.ini \u8BBE AllowEmptyWhitelist=1"
+#define L_STAGE_FREE      L"\u7A7A\u95F2"
+#define L_STAGE_BUSY      L"\u8F83\u591A"
+#define L_STAGE_TIGHT     L"\u7D27\u5F20"
+#define L_TRAY_TIP        L"\u5185\u5B58\u4F18\u5316 - \u53CC\u51FB\u663E\u793A\u4E3B\u754C\u9762"
+#define L_TRAY_SHOW       L"\u663E\u793A\u4E3B\u754C\u9762"
+#define L_TRAY_CLEAN      L"\u7ACB\u5373\u6E05\u7406"
+#define L_TRAY_EXIT       L"\u9000\u51FA"
+#define L_TRAY_MINIMIZED  L"\u5DF2\u6700\u5C0F\u5316\u5230\u7CFB\u7EDF\u6258\u76D8\uFF0C\u53F3\u952E\u6258\u76D8\u56FE\u6807\u53EF\u9000\u51FA"
+
+#define L_WL_FILENAME L"\u767D\u540D\u5355.txt"
+#define L_LOG_FILENAME L"memreduct.log"

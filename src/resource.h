@@ -89,6 +89,20 @@
 #define IDC_ALLOWSTANDBYLISTCLEANUP_CHK 150
 #define IDC_LOGRESULTS_CHK 151
 
+// Main Dlg (whitelist edition)
+#define IDC_INFO_MEM 200
+#define IDC_INFO_DETAIL 201
+#define IDC_AUTO_CHK 202
+#define IDC_AUTO_VALUE_CTRL 203
+#define IDC_AUTO_SUFFIX 204
+#define IDC_SFC_CHK 205
+#define IDC_WL_INFO 206
+#define IDC_WL_EDIT 207
+#define IDC_RESULT 208
+#define IDC_HINT 209
+#define IDC_AUTO_WARN 210
+#define IDC_LEGEND 211
+
 // Main Menu
 #define IDM_SETTINGS 152
 #define IDM_EXIT 153
@@ -240,6 +254,7 @@
 #define IDS_UPDATE_ERROR 79
 #define IDS_UPDATE_INIT 80
 #define IDS_UPDATE_INSTALL 81
+#define IDS_UPDATE_AUTOINSTALL 99
 
 #define IDS_RESET 82
 #define IDS_QUESTION_RESET 83
